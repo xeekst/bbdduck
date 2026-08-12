@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Bundled WebView2 fixed runtime (large; downloaded separately)
+src-tauri/webview2-fixed/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -1,4 +1,5 @@
 pub mod db;
+pub mod net_tool;
 pub mod sync;
 
 use std::collections::HashMap;
@@ -323,6 +324,33 @@ fn list_recent_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<Recent
         .map_err(|e| e.to_string())
 }
 
+// ---------------- network tools ----------------
+
+#[tauri::command]
+fn net_local_info() -> Result<net_tool::LocalNetInfo, String> {
+    net_tool::net_local_info()
+}
+
+#[tauri::command]
+async fn net_tcp_probe(
+    app: AppHandle,
+    host: String,
+    port: u16,
+    timeout_ms: u64,
+) -> Result<net_tool::ProbeResult, String> {
+    net_tool::net_tcp_probe(app, host, port, timeout_ms).await
+}
+
+#[tauri::command]
+async fn net_ping(
+    app: AppHandle,
+    host: String,
+    count: u32,
+    timeout_ms: u64,
+) -> Result<net_tool::PingResult, String> {
+    net_tool::net_ping(app, host, count, timeout_ms).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -354,6 +382,9 @@ pub fn run() {
             delete_server_config,
             save_recent_connection,
             list_recent_connections,
+            net_local_info,
+            net_tcp_probe,
+            net_ping,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,6 +8,7 @@ import type {
   ServerStatus,
   SyncOptions,
 } from "./sync-types";
+import type { LocalNetInfo, PingResult, ProbeResult } from "./net-types";
 
 export async function pickFolder(): Promise<string | null> {
   const res = await open({ directory: true, multiple: false, title: "选择文件夹" });
@@ -54,4 +55,10 @@ export const api = {
   saveRecentConnection: (ip: string, port: number, share: string, localDir: string) =>
     invoke<number>("save_recent_connection", { ip, port, share, localDir }),
   listRecentConnections: () => invoke<RecentConnection[]>("list_recent_connections"),
+
+  netLocalInfo: () => invoke<LocalNetInfo>("net_local_info"),
+  netTcpProbe: (host: string, port: number, timeoutMs: number) =>
+    invoke<ProbeResult>("net_tcp_probe", { host, port, timeoutMs }),
+  netPing: (host: string, count: number, timeoutMs: number) =>
+    invoke<PingResult>("net_ping", { host, count, timeoutMs }),
 };

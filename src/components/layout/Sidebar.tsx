@@ -58,7 +58,7 @@ const GROUPS: NavGroup[] = [
         label: "端口测试",
         to: "/network",
         icon: RefreshCw,
-        disabled: true,
+        description: "TCP 端口连通性检测与 Ping",
       },
     ],
   },

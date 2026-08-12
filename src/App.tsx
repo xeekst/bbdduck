@@ -3,6 +3,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import AppShell from "@/components/layout/AppShell";
 import HomePage from "@/pages/HomePage";
 import FileSyncPage from "@/pages/FileSyncPage";
+import NetworkToolsPage from "@/pages/NetworkToolsPage";
 
 function App() {
   return (
@@ -12,6 +13,7 @@ function App() {
           <Route element={<AppShell />}>
             <Route path="/" element={<HomePage />} />
             <Route path="/sync" element={<FileSyncPage />} />
+            <Route path="/network" element={<NetworkToolsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
