@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
 import {
+  ArrowLeftRight,
   ChevronDown,
   ChevronRight,
   FileText,
@@ -59,6 +60,12 @@ const GROUPS: NavGroup[] = [
         to: "/network",
         icon: RefreshCw,
         description: "TCP 端口连通性检测与 Ping",
+      },
+      {
+        label: "端口转发",
+        to: "/port-forward",
+        icon: ArrowLeftRight,
+        description: "SSH TCP/UDP 隧道（本地/远程/动态）",
       },
     ],
   },

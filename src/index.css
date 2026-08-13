@@ -119,6 +119,85 @@
   }
 }
 
+/* ---------- SSH 隧道数据流向动画 ---------- */
+
+@keyframes tunnel-dash {
+  from {
+    background-position-x: 0;
+  }
+  to {
+    background-position-x: -24px;
+  }
+}
+
+@keyframes tunnel-dot-lr {
+  0% {
+    left: 0%;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    left: 100%;
+    opacity: 0;
+  }
+}
+
+@keyframes tunnel-dot-rl {
+  0% {
+    left: 100%;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    left: 0%;
+    opacity: 0;
+  }
+}
+
+.tunnel-flow-line {
+  background-image: repeating-linear-gradient(
+    90deg,
+    currentColor 0 6px,
+    transparent 6px 12px
+  );
+  background-size: 12px 2px;
+  background-repeat: repeat-x;
+  background-position: 0 50%;
+  animation: tunnel-dash 0.7s linear infinite;
+}
+
+.tunnel-flow-dot {
+  position: absolute;
+  animation-duration: 1.3s;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+/* 运行中脉冲 */
+@keyframes tunnel-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.tunnel-pulse {
+  animation: tunnel-pulse 1.6s ease-in-out infinite;
+}
+
 html,
 body,
 #root {

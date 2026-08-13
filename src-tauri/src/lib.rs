@@ -1,5 +1,6 @@
 pub mod db;
 pub mod net_tool;
+pub mod ssh_tunnel;
 pub mod sync;
 
 use std::collections::HashMap;
@@ -55,9 +56,10 @@ impl JobHandle {
 }
 
 pub struct AppState {
-    pub db: Db,
+    pub db: Arc<Db>,
     pub server: Arc<ServerHandle>,
     pub jobs: Mutex<HashMap<String, Arc<JobHandle>>>,
+    pub tunnels: Arc<ssh_tunnel::TunnelManager>,
 }
 
 // ---------------- server (Node A) ----------------
@@ -351,6 +353,78 @@ async fn net_ping(
     net_tool::net_ping(app, host, count, timeout_ms).await
 }
 
+// ---------------- ssh tunnels (port forwarding) ----------------
+
+#[tauri::command]
+async fn ssh_tunnel_list(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ssh_tunnel::model::TunnelItem>, String> {
+    state.tunnels.list().await
+}
+
+#[tauri::command]
+async fn ssh_tunnel_save(
+    state: State<'_, Arc<AppState>>,
+    config: ssh_tunnel::model::TunnelConfig,
+) -> Result<ssh_tunnel::model::TunnelItem, String> {
+    config.validate()?;
+    // 修改配置时若隧道正在运行，先停止
+    if config.id > 0 {
+        state.tunnels.stop(config.id).await;
+    }
+    let id = state.db.save_tunnel(&config).map_err(|e| e.to_string())?;
+    state
+        .tunnels
+        .list()
+        .await?
+        .into_iter()
+        .find(|i| i.config.id == id)
+        .ok_or_else(|| "隧道已保存，但读取失败".to_string())
+}
+
+#[tauri::command]
+async fn ssh_tunnel_start(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
+    state.tunnels.start(id).await
+}
+
+#[tauri::command]
+async fn ssh_tunnel_stop(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
+    state.tunnels.stop(id).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn ssh_tunnel_delete(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
+    state.tunnels.remove_runtime(id).await;
+    state.db.delete_tunnel(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ssh_tunnel_logs(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<Vec<ssh_tunnel::model::TunnelLogEntry>, String> {
+    Ok(state.tunnels.logs(id).await)
+}
+
+#[tauri::command]
+async fn ssh_tunnel_clear_logs(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
+    state.tunnels.clear_logs(id).await;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -358,13 +432,23 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            let db = Db::open(&dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let db = Arc::new(Db::open(&dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?);
+            let tunnels = Arc::new(ssh_tunnel::TunnelManager::new(
+                app.handle().clone(),
+                db.clone(),
+            ));
             let state = Arc::new(AppState {
                 db,
                 server: Arc::new(ServerHandle::new()),
                 jobs: Mutex::new(HashMap::new()),
+                tunnels,
             });
             app.manage(state);
+            // 应用启动时自动运行 enabled 的隧道
+            let auto = app.state::<Arc<AppState>>().tunnels.clone();
+            tauri::async_runtime::spawn(async move {
+                auto.auto_start().await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -385,6 +469,13 @@ pub fn run() {
             net_local_info,
             net_tcp_probe,
             net_ping,
+            ssh_tunnel_list,
+            ssh_tunnel_save,
+            ssh_tunnel_start,
+            ssh_tunnel_stop,
+            ssh_tunnel_delete,
+            ssh_tunnel_logs,
+            ssh_tunnel_clear_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

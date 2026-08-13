@@ -9,6 +9,11 @@ import type {
   SyncOptions,
 } from "./sync-types";
 import type { LocalNetInfo, PingResult, ProbeResult } from "./net-types";
+import type {
+  TunnelConfig,
+  TunnelItem,
+  TunnelLogEntry,
+} from "./ssh-types";
 
 export async function pickFolder(): Promise<string | null> {
   const res = await open({ directory: true, multiple: false, title: "选择文件夹" });
@@ -61,4 +66,13 @@ export const api = {
     invoke<ProbeResult>("net_tcp_probe", { host, port, timeoutMs }),
   netPing: (host: string, count: number, timeoutMs: number) =>
     invoke<PingResult>("net_ping", { host, count, timeoutMs }),
+
+  sshTunnelList: () => invoke<TunnelItem[]>("ssh_tunnel_list"),
+  sshTunnelSave: (config: TunnelConfig) =>
+    invoke<TunnelItem>("ssh_tunnel_save", { config }),
+  sshTunnelStart: (id: number) => invoke<void>("ssh_tunnel_start", { id }),
+  sshTunnelStop: (id: number) => invoke<void>("ssh_tunnel_stop", { id }),
+  sshTunnelDelete: (id: number) => invoke<void>("ssh_tunnel_delete", { id }),
+  sshTunnelLogs: (id: number) => invoke<TunnelLogEntry[]>("ssh_tunnel_logs", { id }),
+  sshTunnelClearLogs: (id: number) => invoke<void>("ssh_tunnel_clear_logs", { id }),
 };

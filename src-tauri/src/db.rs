@@ -47,6 +47,35 @@ CREATE TABLE IF NOT EXISTS sync_jobs (
   started_at INTEGER NOT NULL,
   finished_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS ssh_tunnels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  tunnel_type TEXT NOT NULL,
+  proto TEXT NOT NULL DEFAULT 'tcp',
+  ssh_host TEXT NOT NULL,
+  ssh_port INTEGER NOT NULL DEFAULT 22,
+  username TEXT NOT NULL,
+  auth TEXT NOT NULL DEFAULT 'password',
+  password TEXT,
+  key_path TEXT,
+  key_passphrase TEXT,
+  listen_host TEXT NOT NULL,
+  listen_port INTEGER NOT NULL,
+  target_host TEXT NOT NULL DEFAULT '',
+  target_port INTEGER NOT NULL DEFAULT 0,
+  keepalive_secs INTEGER NOT NULL DEFAULT 30,
+  auto_reconnect INTEGER NOT NULL DEFAULT 1,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ssh_tunnel_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tunnel_id INTEGER NOT NULL,
+  level TEXT NOT NULL,
+  message TEXT NOT NULL,
+  time INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ssh_tunnel_logs ON ssh_tunnel_logs (tunnel_id, id);
 "#;
 
 impl Db {
@@ -250,5 +279,158 @@ impl Db {
             })
         })?;
         rows.collect()
+    }
+
+    // ---------- ssh tunnels ----------
+
+    pub fn save_tunnel(&self, c: &crate::ssh_tunnel::model::TunnelConfig) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        if c.id > 0 {
+            conn.execute(
+                "UPDATE ssh_tunnels SET name = ?1, tunnel_type = ?2, proto = ?3, ssh_host = ?4,
+                 ssh_port = ?5, username = ?6, auth = ?7, password = ?8, key_path = ?9,
+                 key_passphrase = ?10, listen_host = ?11, listen_port = ?12, target_host = ?13,
+                 target_port = ?14, keepalive_secs = ?15, auto_reconnect = ?16, enabled = ?17
+                 WHERE id = ?18",
+                params![
+                    c.name,
+                    c.tunnel_type.as_str(),
+                    c.proto.as_str(),
+                    c.ssh_host,
+                    c.ssh_port,
+                    c.username,
+                    c.auth.as_str(),
+                    c.password,
+                    c.key_path,
+                    c.key_passphrase,
+                    c.listen_host,
+                    c.listen_port,
+                    c.target_host,
+                    c.target_port,
+                    c.keepalive_secs,
+                    c.auto_reconnect as i64,
+                    c.enabled as i64,
+                    c.id
+                ],
+            )?;
+            return Ok(c.id);
+        }
+        conn.execute(
+            "INSERT INTO ssh_tunnels (name, tunnel_type, proto, ssh_host, ssh_port, username, auth,
+             password, key_path, key_passphrase, listen_host, listen_port, target_host, target_port,
+             keepalive_secs, auto_reconnect, enabled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            params![
+                c.name,
+                c.tunnel_type.as_str(),
+                c.proto.as_str(),
+                c.ssh_host,
+                c.ssh_port,
+                c.username,
+                c.auth.as_str(),
+                c.password,
+                c.key_path,
+                c.key_passphrase,
+                c.listen_host,
+                c.listen_port,
+                c.target_host,
+                c.target_port,
+                c.keepalive_secs,
+                c.auto_reconnect as i64,
+                c.enabled as i64,
+                crate::sync::model::now_secs()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_tunnels(&self) -> rusqlite::Result<Vec<crate::ssh_tunnel::model::TunnelConfig>> {
+        use crate::ssh_tunnel::model::{AuthKind, TunnelConfig, TunnelProto, TunnelType};
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, tunnel_type, proto, ssh_host, ssh_port, username, auth, password,
+                    key_path, key_passphrase, listen_host, listen_port, target_host, target_port,
+                    keepalive_secs, auto_reconnect, enabled, created_at
+             FROM ssh_tunnels ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TunnelConfig {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                tunnel_type: TunnelType::from_str(&r.get::<_, String>(2)?),
+                proto: TunnelProto::from_str(&r.get::<_, String>(3)?),
+                ssh_host: r.get(4)?,
+                ssh_port: r.get(5)?,
+                username: r.get(6)?,
+                auth: AuthKind::from_str(&r.get::<_, String>(7)?),
+                password: r.get(8)?,
+                key_path: r.get(9)?,
+                key_passphrase: r.get(10)?,
+                listen_host: r.get(11)?,
+                listen_port: r.get(12)?,
+                target_host: r.get(13)?,
+                target_port: r.get(14)?,
+                keepalive_secs: r.get(15)?,
+                auto_reconnect: r.get::<_, i64>(16)? != 0,
+                enabled: r.get::<_, i64>(17)? != 0,
+                created_at: r.get(18)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_tunnel(&self, id: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM ssh_tunnels WHERE id = ?1", params![id])?;
+        conn.execute("DELETE FROM ssh_tunnel_logs WHERE tunnel_id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn append_tunnel_log(&self, tunnel_id: i64, level: &str, message: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ssh_tunnel_logs (tunnel_id, level, message, time) VALUES (?1, ?2, ?3, ?4)",
+            params![tunnel_id, level, message, crate::sync::model::now_secs()],
+        )?;
+        // keep only the latest 2000 entries per tunnel
+        let _ = conn.execute(
+            "DELETE FROM ssh_tunnel_logs WHERE tunnel_id = ?1 AND id NOT IN
+             (SELECT id FROM ssh_tunnel_logs WHERE tunnel_id = ?1 ORDER BY id DESC LIMIT 2000)",
+            params![tunnel_id],
+        );
+        Ok(())
+    }
+
+    pub fn list_tunnel_logs(
+        &self,
+        tunnel_id: i64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<crate::ssh_tunnel::model::TunnelLogEntry>> {
+        use crate::ssh_tunnel::model::TunnelLogEntry;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT level, message, time FROM ssh_tunnel_logs WHERE tunnel_id = ?1
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut rows: Vec<TunnelLogEntry> = stmt
+            .query_map(params![tunnel_id, limit as i64], |r| {
+                Ok(TunnelLogEntry {
+                    level: r.get(0)?,
+                    message: r.get(1)?,
+                    time: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    pub fn delete_tunnel_logs(&self, tunnel_id: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM ssh_tunnel_logs WHERE tunnel_id = ?1",
+            params![tunnel_id],
+        )?;
+        Ok(())
     }
 }
