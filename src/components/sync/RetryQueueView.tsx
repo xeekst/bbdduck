@@ -5,7 +5,7 @@ import { syncStore } from "@/lib/syncStore";
 /**
  * Shows files that failed and are queued for automatic retry (up to 3 attempts,
  * 3 seconds apart). Items disappear once a retry succeeds or retries are
- * exhausted (the failure then shows in the log tab).
+ * exhausted (the failure then shows in the transfer list and log tab).
  */
 export default function RetryQueueView() {
   useSyncExternalStore(syncStore.subscribe, syncStore.getSnapshot);

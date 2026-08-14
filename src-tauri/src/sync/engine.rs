@@ -25,6 +25,10 @@ const CHUNK: usize = 256 * 1024;
 const MAX_RETRIES: u32 = 3;
 /// Delay between retry attempts.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
+/// Max listing retries after the scan connection drops mid-way.
+const MAX_LIST_RETRIES: u32 = 3;
+/// Delay between listing retries.
+const LIST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub struct JobProgress {
@@ -113,6 +117,18 @@ impl RetryQueue {
     }
 }
 
+/// Sleeps for `d`, returning early when `stop` is set so retries can be aborted.
+fn sleep_or_stop(stop: &AtomicBool, d: Duration) {
+    let deadline = Instant::now() + d;
+    while !stop.load(Ordering::Relaxed) {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            break;
+        }
+        thread::sleep(remain.min(Duration::from_millis(100)));
+    }
+}
+
 /// Runs a full sync job to completion (or until `stop` is set). Blocks until
 /// everything is finished; the caller should run this on a dedicated thread.
 pub fn run_job<R: Runtime>(
@@ -132,7 +148,11 @@ pub fn run_job<R: Runtime>(
             message: None,
         };
     }
-    log_info(app, job_id, format!("开始同步：{} → {}", opts.share, opts.local_dir));
+    log_info(
+        app,
+        job_id,
+        format!("开始同步：{} → {}", opts.share, opts.local_dir),
+    );
 
     // Relative paths present on the remote, collected during the scan. Only
     // used when mirror-deletion is enabled, to remove local leftovers.
@@ -151,59 +171,109 @@ pub fn run_job<R: Runtime>(
         thread::spawn(move || emitter_loop(&app, &job_id, done_rx, progress, stop))
     };
 
-    // Listing thread: streams the remote file tree into the task queue.
+    // Listing thread: streams the remote file tree into the task queue. If the
+    // connection drops mid-scan (e.g. os error 10054), the scan is retried a
+    // few times instead of failing the whole job; paths already queued are
+    // remembered so a retry does not enqueue duplicates.
     let listing = {
         let task_tx = task_tx.clone();
         let stop = Arc::clone(&stop);
         let progress = Arc::clone(&progress);
+        let app = app.clone();
+        let job_id = job_id.to_string();
         let l_opts = opts.clone();
         let seen = Arc::clone(&seen);
+        let sent_paths = Arc::new(Mutex::new(HashSet::new()));
         thread::spawn(move || {
-            let res = list_remote_files(
-                &l_opts.remote_ip,
-                l_opts.remote_port,
-                &l_opts.share,
-                |entry| {
-                    if l_opts.delete_removed {
-                        seen.lock().unwrap().insert(entry.path.clone());
-                    }
+            let mut last_err: Option<String> = None;
+            for attempt in 0..=MAX_LIST_RETRIES {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if attempt > 0 {
+                    log_info(
+                        &app,
+                        &job_id,
+                        format!(
+                            "扫描远端目录连接中断，{} 秒后进行第 {}/{} 次重试",
+                            LIST_RETRY_INTERVAL.as_secs(),
+                            attempt,
+                            MAX_LIST_RETRIES
+                        ),
+                    );
+                    sleep_or_stop(&stop, LIST_RETRY_INTERVAL);
                     if stop.load(Ordering::Relaxed) {
-                        return false;
-                    }
-                    if entry.is_dir {
-                        return true;
-                    }
-                    if l_opts.incremental {
-                        let lp = Path::new(&l_opts.local_dir).join(&entry.path);
-                        if let Ok(md) = fs::metadata(&lp) {
-                            if md.len() == entry.size && mtime_secs(&md) >= entry.mtime {
-                                let mut p = progress.lock().unwrap();
-                                p.skipped_files += 1;
-                                return true;
-                            }
-                        }
-                    }
-                    {
-                        let mut p = progress.lock().unwrap();
-                        p.total_files += 1;
-                        p.total_bytes += entry.size;
-                    }
-                    task_tx
-                        .send(SyncTask {
-                            path: entry.path.clone(),
-                            size: entry.size,
-                        })
-                        .is_ok()
-                },
-            );
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    let mut p = progress.lock().unwrap();
-                    if p.error.is_none() {
-                        p.error = Some(e);
+                        return;
                     }
                 }
+                let res = list_remote_files(
+                    &l_opts.remote_ip,
+                    l_opts.remote_port,
+                    &l_opts.share,
+                    |entry| {
+                        if l_opts.delete_removed {
+                            seen.lock().unwrap().insert(entry.path.clone());
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        if entry.is_dir {
+                            return true;
+                        }
+                        if sent_paths.lock().unwrap().contains(&entry.path) {
+                            return true;
+                        }
+                        if l_opts.incremental {
+                            let lp = Path::new(&l_opts.local_dir).join(&entry.path);
+                            if let Ok(md) = fs::metadata(&lp) {
+                                if md.len() == entry.size && mtime_secs(&md) >= entry.mtime {
+                                    let mut p = progress.lock().unwrap();
+                                    p.skipped_files += 1;
+                                    sent_paths.lock().unwrap().insert(entry.path.clone());
+                                    return true;
+                                }
+                            }
+                        }
+                        {
+                            let mut p = progress.lock().unwrap();
+                            p.total_files += 1;
+                            p.total_bytes += entry.size;
+                        }
+                        if task_tx
+                            .send(SyncTask {
+                                path: entry.path.clone(),
+                                size: entry.size,
+                            })
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        sent_paths.lock().unwrap().insert(entry.path.clone());
+                        true
+                    },
+                );
+                match res {
+                    Ok(_) => return,
+                    Err(e) => {
+                        last_err = Some(e);
+                        log_error(
+                            &app,
+                            &job_id,
+                            format!(
+                                "扫描远端目录失败：{}",
+                                last_err.as_deref().unwrap_or_default()
+                            ),
+                        );
+                    }
+                }
+            }
+            let mut p = progress.lock().unwrap();
+            if p.error.is_none() {
+                p.error = Some(format!(
+                    "扫描远端目录失败（已重试 {} 次）: {}",
+                    MAX_LIST_RETRIES,
+                    last_err.unwrap_or_default()
+                ));
             }
         })
     };
@@ -229,57 +299,55 @@ pub fn run_job<R: Runtime>(
         let w_opts = opts.clone();
         let app = app.clone();
         let job_id = job_id.to_string();
-        workers.push(thread::spawn(move || {
-            loop {
-                let task = match rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(t) => t,
-                    Err(RecvTimeoutError::Timeout) => {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        continue;
+        workers.push(thread::spawn(move || loop {
+            let task = match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(t) => t,
+                Err(RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
-                match download_file(&app, &job_id, &w_opts, &limiter, &stop, &task, &done_tx) {
-                    Ok(()) => {
-                        let mut p = progress.lock().unwrap();
-                        p.done_files += 1;
-                        p.done_bytes += task.size;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            match download_file(&app, &job_id, &w_opts, &limiter, &stop, &task, &done_tx) {
+                Ok(()) => {
+                    let mut p = progress.lock().unwrap();
+                    p.done_files += 1;
+                    p.done_bytes += task.size;
+                }
+                Err(e) => {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                    Err(e) => {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        retry_queue.push(RetryTask {
+                    retry_queue.push(RetryTask {
+                        path: task.path.clone(),
+                        size: task.size,
+                        attempt: 1,
+                        next_attempt_at: Instant::now() + RETRY_INTERVAL,
+                    });
+                    let _ = app.emit(
+                        EVT_RETRY,
+                        RetryPayload {
+                            id: job_id.clone(),
                             path: task.path.clone(),
-                            size: task.size,
                             attempt: 1,
-                            next_attempt_at: Instant::now() + RETRY_INTERVAL,
-                        });
-                        let _ = app.emit(
-                            EVT_RETRY,
-                            RetryPayload {
-                                id: job_id.clone(),
-                                path: task.path.clone(),
-                                attempt: 1,
-                                max_retries: MAX_RETRIES,
-                                retry_in: RETRY_INTERVAL.as_secs(),
-                                state: "retrying".into(),
-                            },
-                        );
-                        log_info(
-                            &app,
-                            &job_id,
-                            format!(
-                                "{} 下载失败：{}，{} 秒后进行第 1/{} 次重试",
-                                task.path,
-                                e,
-                                RETRY_INTERVAL.as_secs(),
-                                MAX_RETRIES
-                            ),
-                        );
-                    }
+                            max_retries: MAX_RETRIES,
+                            retry_in: RETRY_INTERVAL.as_secs(),
+                            state: "retrying".into(),
+                        },
+                    );
+                    log_info(
+                        &app,
+                        &job_id,
+                        format!(
+                            "{} 下载失败：{}，{} 秒后进行第 1/{} 次重试",
+                            task.path,
+                            e,
+                            RETRY_INTERVAL.as_secs(),
+                            MAX_RETRIES
+                        ),
+                    );
                 }
             }
         }));
@@ -368,7 +436,9 @@ pub fn run_job<R: Runtime>(
     } else {
         JobStatus::Finished
     };
-    let message = if status == JobStatus::Finished && p.total_files == 0 && p.skipped_files > 0 {
+    let message = if status == JobStatus::Finished && p.failed_files > 0 {
+        Some(format!("同步完成，但有 {} 个文件失败", p.failed_files))
+    } else if status == JobStatus::Finished && p.total_files == 0 && p.skipped_files > 0 {
         Some(format!(
             "所有文件已是最新，无需传输（跳过 {} 个文件）",
             p.skipped_files
@@ -376,7 +446,11 @@ pub fn run_job<R: Runtime>(
     } else {
         None
     };
-    log_info(app, job_id, format!("同步线程已退出（{}）", status.as_str()));
+    log_info(
+        app,
+        job_id,
+        format!("同步线程已退出（{}）", status.as_str()),
+    );
     if let Some(m) = &message {
         log_info(app, job_id, m.clone());
     }
@@ -474,9 +548,6 @@ fn spawn_retry_worker<R: Runtime>(
                     } else {
                         let mut p = progress.lock().unwrap();
                         p.failed_files += 1;
-                        if p.error.is_none() {
-                            p.error = Some(format!("{}: {e}", task.path));
-                        }
                         drop(p);
                         let _ = app.emit(
                             EVT_RETRY,
@@ -577,8 +648,13 @@ fn download_file<R: Runtime>(
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|e| e.to_string())?;
 
-    write_msg(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-        .map_err(|e| e.to_string())?;
+    write_msg(
+        &mut stream,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     match read_msg::<_, ServerMsg>(&mut stream).map_err(|e| e.to_string())? {
         Some(ServerMsg::HelloAck { .. }) => {}
         Some(ServerMsg::Error { message }) => return Err(message),
@@ -602,7 +678,8 @@ fn download_file<R: Runtime>(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let mut file = File::create(&dest).map_err(|e| format!("创建文件失败 {}: {e}", dest.display()))?;
+    let mut file =
+        File::create(&dest).map_err(|e| format!("创建文件失败 {}: {e}", dest.display()))?;
 
     // Use a short read timeout so a stop request is honored promptly even if
     // the server stalls; timeouts just retry the read instead of aborting.
@@ -622,8 +699,7 @@ fn download_file<R: Runtime>(
         let n = match stream.read(&mut buf[..to_read]) {
             Ok(n) => n,
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 continue; // no data yet; re-check stop at the loop top
             }
@@ -648,8 +724,7 @@ fn download_file<R: Runtime>(
         file_done += n as u64;
 
         if last_emit.elapsed() >= Duration::from_millis(200) {
-            let speed =
-                (file_done as f64 / file_start.elapsed().as_secs_f64().max(0.001)) as u64;
+            let speed = (file_done as f64 / file_start.elapsed().as_secs_f64().max(0.001)) as u64;
             let _ = app.emit(
                 EVT_PROGRESS,
                 FileProgressPayload {

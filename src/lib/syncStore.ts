@@ -201,6 +201,26 @@ class SyncStore {
   upsertRetry(e: RetryEvent) {
     if (e.state === "failed") {
       this.retries.delete(e.path);
+      let row = this.rowMap.get(e.path);
+      if (!row) {
+        if (this.rows.length >= MAX_ROWS) {
+          const evicted = this.rows.shift();
+          if (evicted) {
+            this.rowMap.delete(evicted.key);
+            if (evicted.status === "active") this.activeCount = Math.max(0, this.activeCount - 1);
+            else if (evicted.status === "done") this.doneCount = Math.max(0, this.doneCount - 1);
+          }
+        }
+        row = { key: e.path, path: e.path, done: 0, total: 0, speed: 0, status: "error" };
+        this.rows.push(row);
+        this.rowMap.set(e.path, row);
+      } else if (row.status !== "done" && row.status !== "deleted") {
+        if (row.status === "active") {
+          this.activeCount = Math.max(0, this.activeCount - 1);
+        }
+        row.status = "error";
+        row.speed = 0;
+      }
     } else {
       this.retries.set(e.path, {
         path: e.path,
