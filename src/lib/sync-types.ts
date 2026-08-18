@@ -55,6 +55,7 @@ export interface ServerConfig {
   ip: string;
   port: number;
   folders: string[];
+  scanWorkers: number;
   createdAt: number;
 }
 

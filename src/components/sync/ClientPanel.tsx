@@ -237,7 +237,7 @@ export default function ClientPanel({
                   <div className="px-2 py-1.5 text-xs text-muted-foreground">暂无共享文件夹</div>
                 )}
                 {shares.map((s) => (
-                  <SelectItem key={s} value={s} className="max-w-[300px]">
+                  <SelectItem key={s} value={s} className="max-w-75">
                     <span className="truncate font-mono">{s}</span>
                   </SelectItem>
                 ))}
@@ -296,11 +296,22 @@ export default function ClientPanel({
             </div>
             <Slider
               min={1}
-              max={32}
+              max={512}
               step={1}
               value={[threads]}
               onValueChange={(v) => setThreads(v[0])}
             />
+            <p
+              className={`text-[10px] ${
+                threads > 64 ? "text-amber-500" : "text-muted-foreground"
+              }`}
+            >
+              {threads > 64
+                ? `警告：${threads} 线程适合海量小文件；若以几十 MB 以上的大文件为主，建议降到 16 以下，否则磁盘写回会成为瓶颈反而更慢`
+                : threads > 32
+                  ? `提示：${threads} 线程偏高，大文件为主时 8~16 线程更优`
+                  : "大量小文件可调高线程数；大文件为主时 8~16 线程更优"}
+            </p>
           </div>
 
           <div className="space-y-1.5">

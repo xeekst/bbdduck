@@ -84,6 +84,7 @@ pub struct ServerConfig {
     pub ip: String,
     pub port: u16,
     pub folders: Vec<String>,
+    pub scan_workers: i64,
     pub created_at: i64,
 }
 

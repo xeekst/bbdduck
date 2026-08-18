@@ -4,11 +4,14 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crossbeam_channel::{bounded, unbounded, RecvTimeoutError, SendTimeoutError, Sender};
+
+use super::half_cpu_workers;
 use super::protocol::{
     mtime_secs, read_msg, safe_join, write_msg, ClientMsg, FileEntry, ServerMsg, PROTOCOL_VERSION,
 };
@@ -16,6 +19,8 @@ use super::protocol::{
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const BATCH_SIZE: usize = 500;
 const CHUNK: usize = 256 * 1024;
+/// Cap on pending file entries waiting to be streamed (backpressure).
+const ENTRY_QUEUE_CAP: usize = 8192;
 
 pub struct ServerHandle {
     running: Arc<AtomicBool>,
@@ -46,8 +51,16 @@ impl ServerHandle {
         self.shares.lock().unwrap().clone()
     }
 
-    /// Start listening on `ip:port` sharing `folders`. Returns the actual bound address.
-    pub fn start(&self, ip: String, port: u16, folders: Vec<String>) -> Result<String, String> {
+    /// Start listening on `ip:port` sharing `folders`. `scan_workers` is the
+    /// number of parallel walker threads used per listing; `0` means auto
+    /// (half of the logical CPUs). Returns the actual bound address.
+    pub fn start(
+        &self,
+        ip: String,
+        port: u16,
+        folders: Vec<String>,
+        scan_workers: usize,
+    ) -> Result<String, String> {
         self.stop();
 
         let listener =
@@ -76,7 +89,7 @@ impl ServerHandle {
                     Ok(s) => {
                         let shares = Arc::clone(&shares);
                         let running = Arc::clone(&running);
-                        thread::spawn(move || handle_connection(s, shares, running));
+                        thread::spawn(move || handle_connection(s, shares, running, scan_workers));
                     }
                     Err(_) => thread::sleep(Duration::from_millis(20)),
                 }
@@ -99,6 +112,7 @@ fn handle_connection(
     mut stream: TcpStream,
     shares: Arc<Mutex<Vec<String>>>,
     _running: Arc<AtomicBool>,
+    scan_workers: usize,
 ) {
     // On Windows, sockets accepted from a non-blocking listener inherit the
     // non-blocking flag; force blocking so our framed reads work.
@@ -150,7 +164,7 @@ fn handle_connection(
                         },
                     )
                 } else {
-                    serve_file_list(&mut stream, PathBuf::from(share))
+                    serve_file_list(&mut stream, PathBuf::from(share), scan_workers)
                 }
             }
             ClientMsg::FetchFile { share, path } => {
@@ -183,13 +197,131 @@ fn handle_connection(
     }
 }
 
-/// Streams the file tree of `root` in batches. Only files count toward totals.
-fn serve_file_list(stream: &mut TcpStream, root: PathBuf) -> io::Result<()> {
-    let mut batch: Vec<FileEntry> = Vec::new();
-    let (total, total_bytes) = walk_and_send(&root, &root, stream, &mut batch)?;
-    if !batch.is_empty() {
-        write_msg(stream, &ServerMsg::FileEntries { entries: batch })?;
+/// Streams the file tree of `root` in batches. A small pool of worker threads
+/// walks directories in parallel (order is not significant to the client,
+/// which treats entries as an unordered set), so `metadata()` syscalls run in
+/// parallel on multi-core machines. Only files count toward totals.
+fn serve_file_list(stream: &mut TcpStream, root: PathBuf, scan_workers: usize) -> io::Result<()> {
+    server_log(&format!("scan start: {}", root.display()));
+    // Directory queue is unbounded on purpose: walkers both produce and
+    // consume it, so a bounded queue could deadlock (all walkers blocked in
+    // send while none is left to receive). Directories are small and each is
+    // processed exactly once, so this stays bounded by the total dir count.
+    let (dir_tx, dir_rx) = unbounded::<PathBuf>();
+    let (entry_tx, entry_rx) = bounded::<FileEntry>(ENTRY_QUEUE_CAP);
+    // Directories either queued or being processed; starts at 1 for the root.
+    let pending = Arc::new(AtomicU64::new(1));
+    let scan_err: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    if dir_tx.send(root.clone()).is_err() {
+        return Ok(());
     }
+
+    let mut workers = Vec::new();
+    // 0 = auto (half of the logical CPUs).
+    let scan_workers = if scan_workers == 0 {
+        half_cpu_workers()
+    } else {
+        scan_workers
+    };
+    for _ in 0..scan_workers {
+        let dir_rx = dir_rx.clone();
+        let entry_tx = entry_tx.clone();
+        let dir_tx = dir_tx.clone();
+        let pending = Arc::clone(&pending);
+        let scan_err = Arc::clone(&scan_err);
+        let stop = Arc::clone(&stop);
+        let root = root.clone();
+        workers.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let dir = match dir_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(d) => d,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if pending.load(Ordering::Relaxed) == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                if let Err(e) = walk_dir(&root, &dir, &dir_tx, &entry_tx, &pending, &stop) {
+                    server_log(&format!("scan walk error: {e}"));
+                    let mut slot = scan_err.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
+        }));
+    }
+    drop(dir_tx);
+    drop(entry_tx);
+
+    // Drainer: stream batches to the client as entries arrive.
+    let mut batch: Vec<FileEntry> = Vec::new();
+    let mut total = 0u64;
+    let mut total_bytes = 0u64;
+    let mut drain_err: Option<io::Error> = None;
+    loop {
+        match entry_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(e) => {
+                if !e.is_dir {
+                    total += 1;
+                    total_bytes += e.size;
+                }
+                batch.push(e);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Keep the stream moving even if walkers are momentarily slow.
+                if !batch.is_empty() {
+                    if let Err(e) = write_msg(
+                        stream,
+                        &ServerMsg::FileEntries {
+                            entries: std::mem::take(&mut batch),
+                        },
+                    ) {
+                        server_log(&format!("scan send error: {e}"));
+                        drain_err = Some(e);
+                        break;
+                    }
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if batch.len() >= BATCH_SIZE {
+            if let Err(e) = write_msg(
+                stream,
+                &ServerMsg::FileEntries {
+                    entries: std::mem::take(&mut batch),
+                },
+            ) {
+                server_log(&format!("scan send error: {e}"));
+                drain_err = Some(e);
+                break;
+            }
+        }
+    }
+    if !batch.is_empty() {
+        if let Err(e) = write_msg(stream, &ServerMsg::FileEntries { entries: batch }) {
+            drain_err = Some(e);
+        }
+    }
+
+    // Always stop walkers before joining so no worker stays blocked on send.
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    if let Some(e) = drain_err.or_else(|| scan_err.lock().unwrap().take()) {
+        server_log(&format!("scan failed: {e}"));
+        return Err(e);
+    }
+    server_log(&format!("scan done: {total} files, {total_bytes} bytes"));
     write_msg(
         stream,
         &ServerMsg::FileEntriesEnd {
@@ -199,16 +331,21 @@ fn serve_file_list(stream: &mut TcpStream, root: PathBuf) -> io::Result<()> {
     )
 }
 
-fn walk_and_send(
+/// Scan one directory: stat each entry and forward it; enqueue subdirectories
+/// for other workers. Each directory is processed by exactly one worker.
+fn walk_dir(
     root: &Path,
     dir: &Path,
-    stream: &mut TcpStream,
-    batch: &mut Vec<FileEntry>,
-) -> io::Result<(u64, u64)> {
-    let mut total = 0u64;
-    let mut total_bytes = 0u64;
+    dir_tx: &Sender<PathBuf>,
+    entry_tx: &Sender<FileEntry>,
+    pending: &AtomicU64,
+    stop: &AtomicBool,
+) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let md = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -219,32 +356,62 @@ fn walk_and_send(
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
         if md.is_dir() {
-            batch.push(FileEntry {
-                path: rel,
-                size: 0,
-                mtime: mtime_secs(&md),
-                is_dir: true,
-            });
-            let (t, b) = walk_and_send(root, &entry.path(), stream, batch)?;
-            total += t;
-            total_bytes += b;
+            pending.fetch_add(1, Ordering::AcqRel);
+            // Unbounded channel: never blocks (see serve_file_list).
+            let _ = dir_tx.send(entry.path());
+            send_with_stop(
+                entry_tx,
+                FileEntry {
+                    path: rel,
+                    size: 0,
+                    mtime: mtime_secs(&md),
+                    is_dir: true,
+                },
+                stop,
+            );
         } else {
-            batch.push(FileEntry {
-                path: rel,
-                size: md.len(),
-                mtime: mtime_secs(&md),
-                is_dir: false,
-            });
-            total += 1;
-            total_bytes += md.len();
-        }
-        if batch.len() >= BATCH_SIZE {
-            write_msg(stream, &ServerMsg::FileEntries {
-                entries: std::mem::take(batch),
-            })?;
+            send_with_stop(
+                entry_tx,
+                FileEntry {
+                    path: rel,
+                    size: md.len(),
+                    mtime: mtime_secs(&md),
+                    is_dir: false,
+                },
+                stop,
+            );
         }
     }
-    Ok((total, total_bytes))
+    Ok(())
+}
+
+/// Send a value on a bounded channel without blocking forever: periodically
+/// re-check `stop` so an aborted listing can shut down its workers promptly.
+fn send_with_stop<T>(tx: &Sender<T>, value: T, stop: &AtomicBool) {
+    let mut value = value;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match tx.send_timeout(value, Duration::from_millis(50)) {
+            Ok(()) => return,
+            Err(SendTimeoutError::Timeout(item)) => value = item,
+            Err(SendTimeoutError::Disconnected(_)) => return,
+        }
+    }
+}
+
+/// Diagnostic log for server-side scan issues: stderr + a temp file so it is
+/// visible even when the app runs as a GUI without a console.
+fn server_log(msg: &str) {
+    eprintln!("[bbdduck-server] {msg}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("bbdduck-server.log"))
+    {
+        let _ = f.write_all(format!("[bbdduck-server] {msg}\n").as_bytes());
+    }
 }
 
 fn serve_file(stream: &mut TcpStream, root: PathBuf, rel: &str) -> io::Result<()> {

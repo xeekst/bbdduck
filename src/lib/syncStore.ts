@@ -80,6 +80,7 @@ class CompletedTree {
 class SyncStore {
   version = 0;
   private listeners = new Set<() => void>();
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null;
 
   jobId: string | null = null;
   rows: TransferRow[] = [];
@@ -105,8 +106,15 @@ class SyncStore {
   getSnapshot = () => this.version;
 
   private bump() {
-    this.version++;
-    for (const l of this.listeners) l();
+    // Coalesce rapid updates (e.g. progress events at high thread counts) into
+    // a single notification, so the UI re-renders at most ~20x/sec instead of
+    // once per event.
+    if (this.notifyTimer) return;
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
+      this.version++;
+      for (const l of this.listeners) l();
+    }, 50);
   }
 
   reset(

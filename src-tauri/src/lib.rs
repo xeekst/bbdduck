@@ -71,8 +71,9 @@ fn server_start(
     ip: String,
     port: u16,
     folders: Vec<String>,
+    scan_workers: usize,
 ) -> Result<ServerStatus, String> {
-    let addr = state.server.start(ip, port, folders)?;
+    let addr = state.server.start(ip, port, folders, scan_workers)?;
     let shares = state.server.shares();
     let status = ServerStatus {
         running: true,
@@ -287,10 +288,11 @@ fn save_server_config(
     ip: String,
     port: u16,
     folders: Vec<String>,
+    scan_workers: i64,
 ) -> Result<i64, String> {
     state
         .db
-        .save_server_config(&name, &ip, port, &folders)
+        .save_server_config(&name, &ip, port, &folders, scan_workers)
         .map_err(|e| e.to_string())
 }
 

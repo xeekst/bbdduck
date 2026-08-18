@@ -11,7 +11,7 @@ use super::protocol::{
 
 /// Connect, handshake and list the shared folders of a Node A server.
 pub fn list_shares(ip: &str, port: u16) -> Result<Vec<String>, String> {
-    let mut stream = connect_with_timeout(ip, port, 5)?;
+    let mut stream = connect_with_timeout(ip, port, 15)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
@@ -38,9 +38,13 @@ pub fn list_remote_files(
     share: &str,
     mut on_entry: impl FnMut(&FileEntry) -> bool,
 ) -> Result<(u64, u64), String> {
-    let mut stream = connect_with_timeout(ip, port, 5)?;
+    // Connect timeout is generous (15s) so a link saturated by many download
+    // connections does not abort the scan; the 900s read timeout is per-read,
+    // not a total budget — the server streams batches continuously, so even a
+    // multi-hour listing is fine, and the margin only guards against stalls.
+    let mut stream = connect_with_timeout(ip, port, 15)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(300)))
+        .set_read_timeout(Some(Duration::from_secs(900)))
         .map_err(|e| e.to_string())?;
     write_msg(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION })
         .map_err(|e| e.to_string())?;

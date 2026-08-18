@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS server_configs (
   ip TEXT NOT NULL,
   port INTEGER NOT NULL,
   folder TEXT NOT NULL,
+  scan_workers INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS recent_connections (
@@ -94,6 +95,15 @@ impl Db {
                 "ALTER TABLE recent_connections ADD COLUMN local_dir TEXT NOT NULL DEFAULT ''",
             )?;
         }
+        // migration for databases created before the scan_workers column existed
+        let has_scan_workers = conn
+            .prepare("SELECT 1 FROM pragma_table_info('server_configs') WHERE name = 'scan_workers'")?
+            .exists([])?;
+        if !has_scan_workers {
+            conn.execute_batch(
+                "ALTER TABLE server_configs ADD COLUMN scan_workers INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -107,12 +117,13 @@ impl Db {
         ip: &str,
         port: u16,
         folders: &[String],
+        scan_workers: i64,
     ) -> rusqlite::Result<i64> {
         let folders_json = serde_json::to_string(folders).unwrap_or_else(|_| "[]".into());
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO server_configs (name, ip, port, folder, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![name, ip, port, folders_json, now_secs()],
+            "INSERT INTO server_configs (name, ip, port, folder, scan_workers, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, ip, port, folders_json, scan_workers, now_secs()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -120,7 +131,7 @@ impl Db {
     pub fn list_server_configs(&self) -> rusqlite::Result<Vec<ServerConfig>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, ip, port, folder, created_at FROM server_configs ORDER BY created_at DESC",
+            "SELECT id, name, ip, port, folder, scan_workers, created_at FROM server_configs ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             let folders_json: String = r.get(4)?;
@@ -130,7 +141,8 @@ impl Db {
                 ip: r.get(2)?,
                 port: r.get(3)?,
                 folders: serde_json::from_str(&folders_json).unwrap_or_default(),
-                created_at: r.get(5)?,
+                scan_workers: r.get(5)?,
+                created_at: r.get(6)?,
             })
         })?;
         rows.collect()

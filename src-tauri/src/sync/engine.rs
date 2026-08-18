@@ -2,7 +2,9 @@
 //! local folder (incremental), downloads files with N parallel workers under a
 //! shared bandwidth cap, and emits progress events to the frontend.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,7 +28,7 @@ const MAX_RETRIES: u32 = 3;
 /// Delay between retry attempts.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Max listing retries after the scan connection drops mid-way.
-const MAX_LIST_RETRIES: u32 = 3;
+const MAX_LIST_RETRIES: u32 = 5120;
 /// Delay between listing retries.
 const LIST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -117,6 +119,55 @@ impl RetryQueue {
     }
 }
 
+/// Hash a relative path into a u64. Used by the mirror-deletion set so it
+/// stores ~16 bytes per file instead of a full string (saves ~10x memory for
+/// hundreds of millions of files). A collision only makes the code *keep* a
+/// local file that would otherwise be deleted, which is the safe direction.
+fn path_hash(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// A bounded FIFO set of recently-enqueued paths, used only to deduplicate
+/// listing retries. The only paths that could be re-enqueued after a scan
+/// drops are those still waiting in the task queue or being downloaded — a
+/// bounded window of `thread_count * 16 + thread_count`. Older paths (already
+/// processed) are handled by the incremental local-file check on a rescan, so
+/// memory stays tiny even for hundreds of millions of files.
+struct BoundedPathSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl BoundedPathSet {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap: cap.max(1),
+        }
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        self.set.contains(path)
+    }
+
+    fn insert(&mut self, path: String) {
+        if self.set.contains(&path) {
+            return;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(path.clone());
+        self.order.push_back(path);
+    }
+}
+
 /// Sleeps for `d`, returning early when `stop` is set so retries can be aborted.
 fn sleep_or_stop(stop: &AtomicBool, d: Duration) {
     let deadline = Instant::now() + d;
@@ -155,10 +206,11 @@ pub fn run_job<R: Runtime>(
     );
 
     // Relative paths present on the remote, collected during the scan. Only
-    // used when mirror-deletion is enabled, to remove local leftovers.
-    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // used when mirror-deletion is enabled, to remove local leftovers. Stored
+    // as u64 hashes to keep memory bounded for huge file counts.
+    let seen: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    let thread_count = opts.threads.max(1).min(64);
+    let thread_count = opts.threads.max(1).min(512);
     let (task_tx, task_rx) = bounded::<SyncTask>(thread_count * 16);
     let (done_tx, done_rx) = bounded::<FileDone>(8192);
 
@@ -183,12 +235,17 @@ pub fn run_job<R: Runtime>(
         let job_id = job_id.to_string();
         let l_opts = opts.clone();
         let seen = Arc::clone(&seen);
-        let sent_paths = Arc::new(Mutex::new(HashSet::new()));
+        // Bounded to the in-pipeline window (queue + in-flight workers) so it
+        // stays tiny regardless of how many files are scanned.
+        let sent_paths = Arc::new(Mutex::new(BoundedPathSet::with_capacity(
+            thread_count * 16 + thread_count,
+        )));
         thread::spawn(move || {
             let mut last_err: Option<String> = None;
+            let mut ok = false;
             for attempt in 0..=MAX_LIST_RETRIES {
                 if stop.load(Ordering::Relaxed) {
-                    return;
+                    break;
                 }
                 if attempt > 0 {
                     log_info(
@@ -203,7 +260,7 @@ pub fn run_job<R: Runtime>(
                     );
                     sleep_or_stop(&stop, LIST_RETRY_INTERVAL);
                     if stop.load(Ordering::Relaxed) {
-                        return;
+                        break;
                     }
                 }
                 let res = list_remote_files(
@@ -212,7 +269,7 @@ pub fn run_job<R: Runtime>(
                     &l_opts.share,
                     |entry| {
                         if l_opts.delete_removed {
-                            seen.lock().unwrap().insert(entry.path.clone());
+                            seen.lock().unwrap().insert(path_hash(&entry.path));
                         }
                         if stop.load(Ordering::Relaxed) {
                             return false;
@@ -224,6 +281,11 @@ pub fn run_job<R: Runtime>(
                             return true;
                         }
                         if l_opts.incremental {
+                            // Skip if the local copy is already up to date.
+                            // One stat per file, done inline: parallelizing
+                            // stat rarely helps (stat is cheap and often the
+                            // disk, not the CPU, is the limit) and only adds
+                            // channel/thread overhead.
                             let lp = Path::new(&l_opts.local_dir).join(&entry.path);
                             if let Ok(md) = fs::metadata(&lp) {
                                 if md.len() == entry.size && mtime_secs(&md) >= entry.mtime {
@@ -253,7 +315,10 @@ pub fn run_job<R: Runtime>(
                     },
                 );
                 match res {
-                    Ok(_) => return,
+                    Ok(_) => {
+                        ok = true;
+                        break;
+                    }
                     Err(e) => {
                         last_err = Some(e);
                         log_error(
@@ -267,13 +332,15 @@ pub fn run_job<R: Runtime>(
                     }
                 }
             }
-            let mut p = progress.lock().unwrap();
-            if p.error.is_none() {
-                p.error = Some(format!(
-                    "扫描远端目录失败（已重试 {} 次）: {}",
-                    MAX_LIST_RETRIES,
-                    last_err.unwrap_or_default()
-                ));
+            if !ok && !stop.load(Ordering::Relaxed) {
+                let mut p = progress.lock().unwrap();
+                if p.error.is_none() {
+                    p.error = Some(format!(
+                        "扫描远端目录失败（已重试 {} 次）: {}",
+                        MAX_LIST_RETRIES,
+                        last_err.unwrap_or_default()
+                    ));
+                }
             }
         })
     };
@@ -578,7 +645,7 @@ fn spawn_retry_worker<R: Runtime>(
 /// Recursively delete local entries whose relative path is not present on the
 /// remote share (used for mirror sync). Deleted paths are pushed to `deleted`.
 /// Returns (deleted_files, deleted_dirs).
-fn delete_missing(root: &Path, seen: &HashSet<String>, deleted: &mut Vec<String>) -> (u64, u64) {
+fn delete_missing(root: &Path, seen: &HashSet<u64>, deleted: &mut Vec<String>) -> (u64, u64) {
     let mut files = 0u64;
     let mut dirs = 0u64;
     visit_delete(root, root, seen, &mut files, &mut dirs, deleted);
@@ -594,13 +661,13 @@ fn rel_of(root: &Path, p: &Path) -> String {
 fn visit_delete(
     root: &Path,
     dir: &Path,
-    seen: &HashSet<String>,
+    seen: &HashSet<u64>,
     files: &mut u64,
     dirs: &mut u64,
     deleted: &mut Vec<String>,
 ) {
     let rel = rel_of(root, dir);
-    if !rel.is_empty() && !seen.contains(&rel) {
+    if !rel.is_empty() && !seen.contains(&path_hash(&rel)) {
         // The whole subtree no longer exists on the remote side.
         if fs::remove_dir_all(dir).is_ok() {
             *dirs += 1;
@@ -620,7 +687,7 @@ fn visit_delete(
         let rrel = rel_of(root, &e.path());
         if md.is_dir() {
             visit_delete(root, &e.path(), seen, files, dirs, deleted);
-        } else if !seen.contains(&rrel) {
+        } else if !seen.contains(&path_hash(&rrel)) {
             if fs::remove_file(&e.path()).is_ok() {
                 *files += 1;
                 deleted.push(rrel);
@@ -640,7 +707,7 @@ fn download_file<R: Runtime>(
     task: &SyncTask,
     done_tx: &Sender<FileDone>,
 ) -> Result<(), String> {
-    let mut stream = connect_with_timeout(&opts.remote_ip, opts.remote_port, 5)?;
+    let mut stream = connect_with_timeout(&opts.remote_ip, opts.remote_port, 15)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -689,6 +756,7 @@ fn download_file<R: Runtime>(
     let mut buf = vec![0u8; CHUNK];
     let file_start = Instant::now();
     let mut last_emit = Instant::now();
+    let mut last_pct: u64 = 0;
     let mut file_done: u64 = 0;
 
     while remaining > 0 {
@@ -723,7 +791,15 @@ fn download_file<R: Runtime>(
         remaining -= n as u64;
         file_done += n as u64;
 
-        if last_emit.elapsed() >= Duration::from_millis(200) {
+        // Throttle progress events: emit on each >=1% change (at most ~100
+        // events per file) plus a 2s heartbeat so very slow large files still
+        // show live speed. Previously every worker emitted every 200ms, which
+        // flooded the frontend at high thread counts.
+        let pct = file_done.saturating_mul(100) / size;
+        let elapsed = last_emit.elapsed();
+        if (pct > last_pct && elapsed >= Duration::from_millis(200))
+            || elapsed >= Duration::from_secs(2)
+        {
             let speed = (file_done as f64 / file_start.elapsed().as_secs_f64().max(0.001)) as u64;
             let _ = app.emit(
                 EVT_PROGRESS,
@@ -735,6 +811,7 @@ fn download_file<R: Runtime>(
                     speed,
                 },
             );
+            last_pct = pct;
             last_emit = Instant::now();
         }
     }
@@ -886,9 +963,9 @@ mod tests {
         fs::create_dir_all(root.join("stale_dir")).unwrap();
         fs::write(root.join("stale_dir/c.txt"), b"c").unwrap();
 
-        let seen: HashSet<String> = ["keep", "keep/a.txt", "keep/sub", "keep/sub/b.txt"]
+        let seen: HashSet<u64> = ["keep", "keep/a.txt", "keep/sub", "keep/sub/b.txt"]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| path_hash(s))
             .collect();
         let mut deleted: Vec<String> = Vec::new();
         let (files, dirs) = delete_missing(&root, &seen, &mut deleted);

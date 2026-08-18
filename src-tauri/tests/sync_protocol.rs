@@ -47,7 +47,12 @@ fn server_lists_and_streams_files() {
 
     let server = ServerHandle::new();
     let addr = server
-        .start("127.0.0.1".into(), 0, vec![src.to_string_lossy().to_string()])
+        .start(
+            "127.0.0.1".into(),
+            0,
+            vec![src.to_string_lossy().to_string()],
+            0,
+        )
         .expect("start server");
     let (ip, port) = addr.rsplit_once(':').map(|(i, p)| {
         (i.to_string(), p.parse::<u16>().expect("port"))
