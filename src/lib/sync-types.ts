@@ -21,13 +21,38 @@ export interface RemoteInfo {
   totalBytes: number;
 }
 
+export interface ServerConnectionInfo {
+  id: number;
+  peer: string;
+  active: boolean;
+  kind: "connecting" | "control" | "listing" | "transfer" | "error";
+  share: string | null;
+  currentFile: string | null;
+  activity: string;
+  bytesSent: number;
+  connectedAt: number;
+  lastActiveAt: number;
+}
+
 export interface ServerStatus {
   running: boolean;
   addr: string | null;
   shares: string[];
+  connections: ServerConnectionInfo[];
 }
 
 export type JobStatus = "running" | "finished" | "stopped" | "error";
+export type SyncPhase =
+  | "preparing"
+  | "scanning"
+  | "transferring"
+  | "retrying"
+  | "finalizing"
+  | "deleting"
+  | "finished"
+  | "stopped"
+  | "error";
+
 
 export interface JobSnapshot {
   id: string;
@@ -44,6 +69,13 @@ export interface JobSnapshot {
   totalBytes: number;
   doneBytes: number;
   speed: number;
+  scannedFiles: number;
+  activeFiles: number;
+  listingComplete: boolean;
+  listAttempt: number;
+  phase: SyncPhase;
+  activity: string;
+  currentFile: string | null;
   error: string | null;
   startedAt: number;
   finishedAt: number | null;
@@ -55,6 +87,7 @@ export interface ServerConfig {
   ip: string;
   port: number;
   folders: string[];
+  scanWorkers: number;
   createdAt: number;
 }
 
@@ -74,6 +107,7 @@ export interface ServerEvent {
   addr?: string | null;
   shares?: string[];
   message?: string;
+  connections?: ServerConnectionInfo[];
 }
 
 export interface JobEvent {
@@ -87,6 +121,13 @@ export interface JobEvent {
   doneBytes: number;
   speed: number;
   message?: string;
+  scannedFiles: number;
+  activeFiles: number;
+  listingComplete: boolean;
+  listAttempt: number;
+  phase: SyncPhase;
+  activity: string;
+  currentFile: string | null;
 }
 
 export interface FileProgressEvent {
@@ -121,9 +162,11 @@ export interface RetryEvent {
 
 export interface LogEvent {
   id: string;
+  source: "client" | "server";
   level: "info" | "warn" | "error";
   message: string;
   time: number;
+  file?: string | null;
 }
 
 export const EVT_SERVER = "sync-server";

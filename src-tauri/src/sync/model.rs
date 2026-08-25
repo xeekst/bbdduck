@@ -32,6 +32,23 @@ pub struct ServerStatus {
     pub running: bool,
     pub addr: Option<String>,
     pub shares: Vec<String>,
+    pub connections: Vec<ServerConnectionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerConnectionInfo {
+    pub id: u64,
+    pub peer: String,
+    pub active: bool,
+    /// connecting / control / listing / transfer
+    pub kind: String,
+    pub share: Option<String>,
+    pub current_file: Option<String>,
+    pub activity: String,
+    pub bytes_sent: u64,
+    pub connected_at: i64,
+    pub last_active_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -71,6 +88,13 @@ pub struct JobSnapshot {
     pub total_bytes: u64,
     pub done_bytes: u64,
     pub speed: u64,
+    pub scanned_files: u64,
+    pub active_files: u64,
+    pub listing_complete: bool,
+    pub list_attempt: u32,
+    pub phase: String,
+    pub activity: String,
+    pub current_file: Option<String>,
     pub error: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
@@ -84,6 +108,7 @@ pub struct ServerConfig {
     pub ip: String,
     pub port: u16,
     pub folders: Vec<String>,
+    pub scan_workers: i64,
     pub created_at: i64,
 }
 
@@ -106,6 +131,7 @@ pub struct ServerEventPayload {
     pub running: bool,
     pub addr: Option<String>,
     pub shares: Vec<String>,
+    pub connections: Vec<ServerConnectionInfo>,
     pub message: Option<String>,
 }
 
@@ -121,6 +147,13 @@ pub struct JobEventPayload {
     pub total_bytes: u64,
     pub done_bytes: u64,
     pub speed: u64,
+    pub scanned_files: u64,
+    pub active_files: u64,
+    pub listing_complete: bool,
+    pub list_attempt: u32,
+    pub phase: String,
+    pub activity: String,
+    pub current_file: Option<String>,
     pub message: Option<String>,
 }
 
@@ -173,9 +206,12 @@ pub struct RetryPayload {
 #[serde(rename_all = "camelCase")]
 pub struct LogPayload {
     pub id: String,
+    /// client / server
+    pub source: String,
     pub level: String,
     pub message: String,
     pub time: i64,
+    pub file: Option<String>,
 }
 
 pub const EVT_SERVER: &str = "sync-server";

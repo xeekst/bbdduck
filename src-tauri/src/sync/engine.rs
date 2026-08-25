@@ -2,11 +2,13 @@
 //! local folder (incremental), downloads files with N parallel workers under a
 //! shared bandwidth cap, and emits progress events to the frontend.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,14 +17,16 @@ use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use tauri::{AppHandle, Emitter, Runtime};
 
 use super::client::{list_remote_files, BandwidthLimiter};
+use super::logging;
 use super::model::*;
 use super::protocol::{
     connect_with_timeout, mtime_secs, read_msg, write_msg, ClientMsg, ServerMsg, PROTOCOL_VERSION,
 };
+use super::MAX_PATH_FAILURES;
 
 const CHUNK: usize = 256 * 1024;
 /// Max retries per file after the first failure.
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = MAX_PATH_FAILURES;
 /// Delay between retry attempts.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Max listing retries after the scan connection drops mid-way.
@@ -30,7 +34,6 @@ const MAX_LIST_RETRIES: u32 = 3;
 /// Delay between listing retries.
 const LIST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
-#[derive(Default)]
 pub struct JobProgress {
     pub total_files: u64,
     pub done_files: u64,
@@ -40,6 +43,35 @@ pub struct JobProgress {
     pub done_bytes: u64,
     pub speed: u64,
     pub error: Option<String>,
+    pub scanned_files: u64,
+    pub active_files: u64,
+    pub listing_complete: bool,
+    pub list_attempt: u32,
+    pub phase: String,
+    pub activity: String,
+    pub current_file: Option<String>,
+}
+
+impl Default for JobProgress {
+    fn default() -> Self {
+        Self {
+            total_files: 0,
+            done_files: 0,
+            failed_files: 0,
+            skipped_files: 0,
+            total_bytes: 0,
+            done_bytes: 0,
+            speed: 0,
+            error: None,
+            scanned_files: 0,
+            active_files: 0,
+            listing_complete: false,
+            list_attempt: 1,
+            phase: "preparing".into(),
+            activity: "正在初始化同步任务".into(),
+            current_file: None,
+        }
+    }
 }
 
 pub struct JobSummary {
@@ -85,6 +117,10 @@ impl RetryQueue {
         self.condvar.notify_one();
     }
 
+    fn is_empty(&self) -> bool {
+        self.items.lock().unwrap().is_empty()
+    }
+
     fn notify_all(&self) {
         self.condvar.notify_all();
     }
@@ -114,6 +150,55 @@ impl RetryQueue {
             };
             drop(guard); // release before the next iteration re-locks
         }
+    }
+}
+
+/// Hash a relative path into a u64. Used by the mirror-deletion set so it
+/// stores ~16 bytes per file instead of a full string (saves ~10x memory for
+/// hundreds of millions of files). A collision only makes the code *keep* a
+/// local file that would otherwise be deleted, which is the safe direction.
+fn path_hash(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// A bounded FIFO set of recently-enqueued paths, used only to deduplicate
+/// listing retries. The only paths that could be re-enqueued after a scan
+/// drops are those still waiting in the task queue or being downloaded — a
+/// bounded window of `thread_count * 16 + thread_count`. Older paths (already
+/// processed) are handled by the incremental local-file check on a rescan, so
+/// memory stays tiny even for hundreds of millions of files.
+struct BoundedPathSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl BoundedPathSet {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap: cap.max(1),
+        }
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        self.set.contains(path)
+    }
+
+    fn insert(&mut self, path: String) {
+        if self.set.contains(&path) {
+            return;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(path.clone());
+        self.order.push_back(path);
     }
 }
 
@@ -148,6 +233,11 @@ pub fn run_job<R: Runtime>(
             message: None,
         };
     }
+    {
+        let mut p = progress.lock().unwrap();
+        p.phase = "scanning".into();
+        p.activity = "正在连接服务端并扫描远端目录".into();
+    }
     log_info(
         app,
         job_id,
@@ -155,10 +245,14 @@ pub fn run_job<R: Runtime>(
     );
 
     // Relative paths present on the remote, collected during the scan. Only
-    // used when mirror-deletion is enabled, to remove local leftovers.
-    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // used when mirror-deletion is enabled, to remove local leftovers. Stored
+    // as u64 hashes to keep memory bounded for huge file counts.
+    let seen: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Non-zero means the server completed a partial scan after giving up on
+    // inaccessible paths. This is also a safety gate for mirror deletion.
+    let remote_skipped_paths = Arc::new(AtomicU64::new(0));
 
-    let thread_count = opts.threads.max(1).min(64);
+    let thread_count = opts.threads.max(1).min(512);
     let (task_tx, task_rx) = bounded::<SyncTask>(thread_count * 16);
     let (done_tx, done_rx) = bounded::<FileDone>(8192);
 
@@ -183,12 +277,29 @@ pub fn run_job<R: Runtime>(
         let job_id = job_id.to_string();
         let l_opts = opts.clone();
         let seen = Arc::clone(&seen);
-        let sent_paths = Arc::new(Mutex::new(HashSet::new()));
+        let remote_skipped_paths = Arc::clone(&remote_skipped_paths);
+        // Bounded to the in-pipeline window (queue + in-flight workers) so it
+        // stays tiny regardless of how many files are scanned.
+        let sent_paths = Arc::new(Mutex::new(BoundedPathSet::with_capacity(
+            thread_count * 16 + thread_count,
+        )));
         thread::spawn(move || {
             let mut last_err: Option<String> = None;
+            let mut ok = false;
             for attempt in 0..=MAX_LIST_RETRIES {
+                let mut attempt_files = 0u64;
                 if stop.load(Ordering::Relaxed) {
-                    return;
+                    break;
+                }
+                {
+                    let mut p = progress.lock().unwrap();
+                    p.list_attempt = attempt + 1;
+                    p.phase = if attempt == 0 { "scanning" } else { "retrying" }.into();
+                    p.activity = if attempt == 0 {
+                        "正在扫描远端目录".into()
+                    } else {
+                        format!("正在准备第 {attempt}/{MAX_LIST_RETRIES} 次目录扫描重试")
+                    };
                 }
                 if attempt > 0 {
                     log_info(
@@ -203,7 +314,7 @@ pub fn run_job<R: Runtime>(
                     );
                     sleep_or_stop(&stop, LIST_RETRY_INTERVAL);
                     if stop.load(Ordering::Relaxed) {
-                        return;
+                        break;
                     }
                 }
                 let res = list_remote_files(
@@ -212,7 +323,7 @@ pub fn run_job<R: Runtime>(
                     &l_opts.share,
                     |entry| {
                         if l_opts.delete_removed {
-                            seen.lock().unwrap().insert(entry.path.clone());
+                            seen.lock().unwrap().insert(path_hash(&entry.path));
                         }
                         if stop.load(Ordering::Relaxed) {
                             return false;
@@ -220,10 +331,33 @@ pub fn run_job<R: Runtime>(
                         if entry.is_dir {
                             return true;
                         }
+                        attempt_files += 1;
+                        {
+                            let mut p = progress.lock().unwrap();
+                            p.scanned_files += 1;
+                            if p.scanned_files % 2048 == 0 && p.active_files == 0 {
+                                p.activity = format!("正在扫描：{}", entry.path);
+                            }
+                        }
+                        if attempt_files % 100_000 == 0 {
+                            log_info(
+                                &app,
+                                &job_id,
+                                format!(
+                                    "远端目录已扫描 {} 个文件，当前：{}",
+                                    attempt_files, entry.path
+                                ),
+                            );
+                        }
                         if sent_paths.lock().unwrap().contains(&entry.path) {
                             return true;
                         }
                         if l_opts.incremental {
+                            // Skip if the local copy is already up to date.
+                            // One stat per file, done inline: parallelizing
+                            // stat rarely helps (stat is cheap and often the
+                            // disk, not the CPU, is the limit) and only adds
+                            // channel/thread overhead.
                             let lp = Path::new(&l_opts.local_dir).join(&entry.path);
                             if let Ok(md) = fs::metadata(&lp) {
                                 if md.len() == entry.size && mtime_secs(&md) >= entry.mtime {
@@ -253,7 +387,39 @@ pub fn run_job<R: Runtime>(
                     },
                 );
                 match res {
-                    Ok(_) => return,
+                    Ok((remote_files, remote_bytes, skipped_paths)) => {
+                        ok = true;
+                        remote_skipped_paths.store(skipped_paths, Ordering::Relaxed);
+                        if !stop.load(Ordering::Relaxed) {
+                            let mut p = progress.lock().unwrap();
+                            p.listing_complete = true;
+                            p.phase = if p.active_files > 0 || p.done_files < p.total_files {
+                                "transferring"
+                            } else {
+                                "finalizing"
+                            }
+                            .into();
+                            p.activity = if skipped_paths > 0 {
+                                format!(
+                                    "远端目录扫描完成：{remote_files} 个文件，已跳过 {skipped_paths} 个异常路径"
+                                )
+                            } else {
+                                format!(
+                                    "远端目录扫描完成：{remote_files} 个文件，正在等待传输队列结束"
+                                )
+                            };
+                            drop(p);
+                            let summary = format!(
+                                "远端目录扫描完成：{remote_files} 个文件，{remote_bytes} 字节，服务端跳过 {skipped_paths} 个异常路径"
+                            );
+                            if skipped_paths > 0 {
+                                log_warn(&app, &job_id, summary);
+                            } else {
+                                log_info(&app, &job_id, summary);
+                            }
+                        }
+                        break;
+                    }
                     Err(e) => {
                         last_err = Some(e);
                         log_error(
@@ -264,16 +430,35 @@ pub fn run_job<R: Runtime>(
                                 last_err.as_deref().unwrap_or_default()
                             ),
                         );
+                        if attempt_files > 0 {
+                            let message = format!(
+                                "远端目录扫描在已处理 {attempt_files} 个文件后中断。为避免从头重扫造成重复统计和数小时假卡死，已结束本次任务：{}",
+                                last_err.as_deref().unwrap_or_default()
+                            );
+                            let mut p = progress.lock().unwrap();
+                            p.phase = "error".into();
+                            p.activity = "远端目录扫描中断".into();
+                            if p.error.is_none() {
+                                p.error = Some(message.clone());
+                            }
+                            drop(p);
+                            log_error(&app, &job_id, message);
+                            break;
+                        }
                     }
                 }
             }
-            let mut p = progress.lock().unwrap();
-            if p.error.is_none() {
-                p.error = Some(format!(
-                    "扫描远端目录失败（已重试 {} 次）: {}",
-                    MAX_LIST_RETRIES,
-                    last_err.unwrap_or_default()
-                ));
+            if !ok && !stop.load(Ordering::Relaxed) {
+                let mut p = progress.lock().unwrap();
+                if p.error.is_none() {
+                    p.error = Some(format!(
+                        "扫描远端目录失败（已重试 {} 次）: {}",
+                        MAX_LIST_RETRIES,
+                        last_err.unwrap_or_default()
+                    ));
+                    p.phase = "error".into();
+                    p.activity = "无法连接远端目录扫描服务".into();
+                }
             }
         })
     };
@@ -310,7 +495,10 @@ pub fn run_job<R: Runtime>(
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             };
-            match download_file(&app, &job_id, &w_opts, &limiter, &stop, &task, &done_tx) {
+            transfer_started(&app, &job_id, &progress, &task);
+            let result = download_file(&app, &job_id, &w_opts, &limiter, &stop, &task, &done_tx);
+            transfer_finished(&progress);
+            match result {
                 Ok(()) => {
                     let mut p = progress.lock().unwrap();
                     p.done_files += 1;
@@ -337,7 +525,7 @@ pub fn run_job<R: Runtime>(
                             state: "retrying".into(),
                         },
                     );
-                    log_info(
+                    log_warn(
                         &app,
                         &job_id,
                         format!(
@@ -375,6 +563,20 @@ pub fn run_job<R: Runtime>(
         let _ = w.join();
     }
 
+    {
+        let mut p = progress.lock().unwrap();
+        if p.error.is_none() && !stop.load(Ordering::Relaxed) {
+            if retry_queue.is_empty() {
+                p.phase = "finalizing".into();
+                p.activity = "传输队列已清空，正在汇总结果".into();
+            } else {
+                p.phase = "retrying".into();
+                p.activity = "正在处理失败文件重试队列".into();
+            }
+        }
+    }
+    log_info(app, job_id, "远端扫描与主传输队列已结束，正在处理收尾任务");
+
     // Normal transfers finished: drain the retry queue with the full pool.
     main_done.store(true, Ordering::Relaxed);
     retry_queue.notify_all();
@@ -396,13 +598,37 @@ pub fn run_job<R: Runtime>(
         let _ = w.join();
     }
 
+    {
+        let mut p = progress.lock().unwrap();
+        if p.error.is_none() && !stop.load(Ordering::Relaxed) {
+            p.phase = "finalizing".into();
+            p.activity = "正在写入最终统计并检查镜像删除".into();
+        }
+    }
     drop(done_tx);
     let _ = emitter.join();
 
     // Mirror-deletion: remove local files/dirs that no longer exist on the remote.
     if opts.delete_removed && !stop.load(Ordering::Relaxed) {
+        let skipped_paths = remote_skipped_paths.load(Ordering::Relaxed);
         let has_error = progress.lock().unwrap().error.is_some();
-        if !has_error {
+        if skipped_paths > 0 {
+            log_warn(
+                app,
+                job_id,
+                format!(
+                    "服务端跳过了 {skipped_paths} 个无法访问路径，本次已禁用镜像删除以防误删本地文件"
+                ),
+            );
+        } else if !has_error {
+            let payload = {
+                let mut p = progress.lock().unwrap();
+                p.phase = "deleting".into();
+                p.activity = "正在删除远端已不存在的本地文件".into();
+                job_payload(job_id, JobStatus::Running, &p, None)
+            };
+            let _ = app.emit(EVT_JOB, payload);
+            log_info(app, job_id, "开始检查并删除远端已不存在的本地文件");
             let mut deleted_paths: Vec<String> = Vec::new();
             let (del_files, del_dirs) = {
                 let seen = seen.lock().unwrap();
@@ -428,7 +654,8 @@ pub fn run_job<R: Runtime>(
         }
     }
 
-    let p = progress.lock().unwrap();
+    let remote_skipped_path_count = remote_skipped_paths.load(Ordering::Relaxed);
+    let mut p = progress.lock().unwrap();
     let status = if stop.load(Ordering::Relaxed) {
         JobStatus::Stopped
     } else if p.error.is_some() {
@@ -436,8 +663,37 @@ pub fn run_job<R: Runtime>(
     } else {
         JobStatus::Finished
     };
-    let message = if status == JobStatus::Finished && p.failed_files > 0 {
-        Some(format!("同步完成，但有 {} 个文件失败", p.failed_files))
+    match status {
+        JobStatus::Finished => {
+            p.phase = "finished".into();
+            p.activity = "同步已完成".into();
+        }
+        JobStatus::Stopped => {
+            p.phase = "stopped".into();
+            p.activity = "同步已停止".into();
+        }
+        JobStatus::Error => {
+            p.phase = "error".into();
+            p.activity = "同步失败，请查看错误日志".into();
+        }
+        JobStatus::Running => {}
+    }
+    p.current_file = None;
+    p.active_files = 0;
+    let partial_success =
+        status == JobStatus::Finished && (p.failed_files > 0 || remote_skipped_path_count > 0);
+    let message = if partial_success {
+        Some(match (p.failed_files, remote_skipped_path_count) {
+            (failed, skipped) if failed > 0 && skipped > 0 => format!(
+                "同步已尽可能完成：{failed} 个文件重试 {MAX_RETRIES} 次后失败，服务端跳过 {skipped} 个异常路径"
+            ),
+            (failed, _) if failed > 0 => format!(
+                "同步已尽可能完成：{failed} 个文件重试 {MAX_RETRIES} 次后失败并已跳过"
+            ),
+            (_, skipped) => format!(
+                "同步已尽可能完成：服务端在连续失败 {MAX_PATH_FAILURES} 次后跳过 {skipped} 个异常路径"
+            ),
+        })
     } else if status == JobStatus::Finished && p.total_files == 0 && p.skipped_files > 0 {
         Some(format!(
             "所有文件已是最新，无需传输（跳过 {} 个文件）",
@@ -452,7 +708,11 @@ pub fn run_job<R: Runtime>(
         format!("同步线程已退出（{}）", status.as_str()),
     );
     if let Some(m) = &message {
-        log_info(app, job_id, m.clone());
+        if partial_success {
+            log_warn(app, job_id, m.clone());
+        } else {
+            log_info(app, job_id, m.clone());
+        }
     }
     JobSummary {
         status,
@@ -505,7 +765,10 @@ fn spawn_retry_worker<R: Runtime>(
                 path: task.path.clone(),
                 size: task.size,
             };
-            match download_file(&app, &job_id, &opts, &limiter, &stop, &sync_task, &done_tx) {
+            transfer_started(&app, &job_id, &progress, &sync_task);
+            let result = download_file(&app, &job_id, &opts, &limiter, &stop, &sync_task, &done_tx);
+            transfer_finished(&progress);
+            match result {
                 Ok(()) => {
                     let mut p = progress.lock().unwrap();
                     p.done_files += 1;
@@ -533,7 +796,7 @@ fn spawn_retry_worker<R: Runtime>(
                                 state: "retrying".into(),
                             },
                         );
-                        log_info(
+                        log_warn(
                             &app,
                             &job_id,
                             format!(
@@ -578,7 +841,7 @@ fn spawn_retry_worker<R: Runtime>(
 /// Recursively delete local entries whose relative path is not present on the
 /// remote share (used for mirror sync). Deleted paths are pushed to `deleted`.
 /// Returns (deleted_files, deleted_dirs).
-fn delete_missing(root: &Path, seen: &HashSet<String>, deleted: &mut Vec<String>) -> (u64, u64) {
+fn delete_missing(root: &Path, seen: &HashSet<u64>, deleted: &mut Vec<String>) -> (u64, u64) {
     let mut files = 0u64;
     let mut dirs = 0u64;
     visit_delete(root, root, seen, &mut files, &mut dirs, deleted);
@@ -594,13 +857,13 @@ fn rel_of(root: &Path, p: &Path) -> String {
 fn visit_delete(
     root: &Path,
     dir: &Path,
-    seen: &HashSet<String>,
+    seen: &HashSet<u64>,
     files: &mut u64,
     dirs: &mut u64,
     deleted: &mut Vec<String>,
 ) {
     let rel = rel_of(root, dir);
-    if !rel.is_empty() && !seen.contains(&rel) {
+    if !rel.is_empty() && !seen.contains(&path_hash(&rel)) {
         // The whole subtree no longer exists on the remote side.
         if fs::remove_dir_all(dir).is_ok() {
             *dirs += 1;
@@ -620,7 +883,7 @@ fn visit_delete(
         let rrel = rel_of(root, &e.path());
         if md.is_dir() {
             visit_delete(root, &e.path(), seen, files, dirs, deleted);
-        } else if !seen.contains(&rrel) {
+        } else if !seen.contains(&path_hash(&rrel)) {
             if fs::remove_file(&e.path()).is_ok() {
                 *files += 1;
                 deleted.push(rrel);
@@ -640,7 +903,7 @@ fn download_file<R: Runtime>(
     task: &SyncTask,
     done_tx: &Sender<FileDone>,
 ) -> Result<(), String> {
-    let mut stream = connect_with_timeout(&opts.remote_ip, opts.remote_port, 5)?;
+    let mut stream = connect_with_timeout(&opts.remote_ip, opts.remote_port, 15)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -689,6 +952,7 @@ fn download_file<R: Runtime>(
     let mut buf = vec![0u8; CHUNK];
     let file_start = Instant::now();
     let mut last_emit = Instant::now();
+    let mut last_pct: u64 = 0;
     let mut file_done: u64 = 0;
 
     while remaining > 0 {
@@ -723,7 +987,15 @@ fn download_file<R: Runtime>(
         remaining -= n as u64;
         file_done += n as u64;
 
-        if last_emit.elapsed() >= Duration::from_millis(200) {
+        // Throttle progress events: emit on each >=1% change (at most ~100
+        // events per file) plus a 2s heartbeat so very slow large files still
+        // show live speed. Previously every worker emitted every 200ms, which
+        // flooded the frontend at high thread counts.
+        let pct = file_done.saturating_mul(100) / size;
+        let elapsed = last_emit.elapsed();
+        if (pct > last_pct && elapsed >= Duration::from_millis(200))
+            || elapsed >= Duration::from_secs(2)
+        {
             let speed = (file_done as f64 / file_start.elapsed().as_secs_f64().max(0.001)) as u64;
             let _ = app.emit(
                 EVT_PROGRESS,
@@ -735,6 +1007,7 @@ fn download_file<R: Runtime>(
                     speed,
                 },
             );
+            last_pct = pct;
             last_emit = Instant::now();
         }
     }
@@ -827,6 +1100,53 @@ fn flush_files<R: Runtime>(app: &AppHandle<R>, job_id: &str, buf: &mut Vec<FileD
     );
 }
 
+fn transfer_started<R: Runtime>(
+    app: &AppHandle<R>,
+    job_id: &str,
+    progress: &Arc<Mutex<JobProgress>>,
+    task: &SyncTask,
+) {
+    {
+        let mut p = progress.lock().unwrap();
+        p.active_files += 1;
+        p.current_file = Some(task.path.clone());
+        if p.listing_complete {
+            p.phase = "transferring".into();
+        }
+        p.activity = format!("正在传输：{}", task.path);
+    }
+    // Emit immediately, before connecting or reading the first data block, so
+    // every in-flight file has a visible row in the client UI from 0% onward.
+    let _ = app.emit(
+        EVT_PROGRESS,
+        FileProgressPayload {
+            id: job_id.to_string(),
+            path: task.path.clone(),
+            done: 0,
+            total: task.size,
+            speed: 0,
+        },
+    );
+}
+
+fn transfer_finished(progress: &Arc<Mutex<JobProgress>>) {
+    let mut p = progress.lock().unwrap();
+    p.active_files = p.active_files.saturating_sub(1);
+    if p.active_files == 0 {
+        p.current_file = None;
+        if p.listing_complete {
+            if p.done_files < p.total_files {
+                p.activity = "正在等待传输队列".into();
+            } else {
+                p.phase = "finalizing".into();
+                p.activity = "传输已完成，正在等待远端目录扫描结束".into();
+            }
+        } else {
+            p.activity = "正在继续扫描远端目录".into();
+        }
+    }
+}
+
 fn job_payload(
     job_id: &str,
     status: JobStatus,
@@ -843,32 +1163,27 @@ fn job_payload(
         total_bytes: p.total_bytes,
         done_bytes: p.done_bytes,
         speed: p.speed,
+        scanned_files: p.scanned_files,
+        active_files: p.active_files,
+        listing_complete: p.listing_complete,
+        list_attempt: p.list_attempt,
+        phase: p.phase.clone(),
+        activity: p.activity.clone(),
+        current_file: p.current_file.clone(),
         message,
     }
 }
 
 pub fn log_info<R: Runtime>(app: &AppHandle<R>, job_id: &str, message: impl Into<String>) {
-    let _ = app.emit(
-        EVT_LOG,
-        LogPayload {
-            id: job_id.to_string(),
-            level: "info".into(),
-            message: message.into(),
-            time: now_secs(),
-        },
-    );
+    logging::emit(app, job_id, "client", "info", message);
+}
+
+pub fn log_warn<R: Runtime>(app: &AppHandle<R>, job_id: &str, message: impl Into<String>) {
+    logging::emit(app, job_id, "client", "warn", message);
 }
 
 pub fn log_error<R: Runtime>(app: &AppHandle<R>, job_id: &str, message: impl Into<String>) {
-    let _ = app.emit(
-        EVT_LOG,
-        LogPayload {
-            id: job_id.to_string(),
-            level: "error".into(),
-            message: message.into(),
-            time: now_secs(),
-        },
-    );
+    logging::emit(app, job_id, "client", "error", message);
 }
 
 #[cfg(test)]
@@ -886,9 +1201,9 @@ mod tests {
         fs::create_dir_all(root.join("stale_dir")).unwrap();
         fs::write(root.join("stale_dir/c.txt"), b"c").unwrap();
 
-        let seen: HashSet<String> = ["keep", "keep/a.txt", "keep/sub", "keep/sub/b.txt"]
+        let seen: HashSet<u64> = ["keep", "keep/a.txt", "keep/sub", "keep/sub/b.txt"]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| path_hash(s))
             .collect();
         let mut deleted: Vec<String> = Vec::new();
         let (files, dirs) = delete_missing(&root, &seen, &mut deleted);

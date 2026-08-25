@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Slider } from "@/components/ui/slider";
 import {
   Select,
   SelectContent,
@@ -29,7 +30,7 @@ import {
 } from "@/components/ui/select";
 
 function defaultStatus(): ServerStatus {
-  return { running: false, addr: null, shares: [] };
+  return { running: false, addr: null, shares: [], connections: [] };
 }
 
 interface ServerPanelProps {
@@ -41,6 +42,7 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
   const [ip, setIp] = useState("0.0.0.0");
   const [port, setPort] = useState("7788");
   const [folders, setFolders] = useState<string[]>([]);
+  const [scanWorkers, setScanWorkers] = useState(0); // 0 = 自动
   const [status, setStatus] = useState<ServerStatus>(defaultStatus);
   const [saved, setSaved] = useState<ServerConfig[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
@@ -57,15 +59,25 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
 
   useEffect(() => {
     refreshSaved();
+    const refreshStatus = () => {
+      api.serverStatus().then(setStatus).catch(() => {
+        /* 服务端未启动或应用正在退出 */
+      });
+    };
+    refreshStatus();
+    const statusTimer = setInterval(refreshStatus, 1000);
+
     const un = listen<ServerEvent>(EVT_SERVER, (e) => {
       setStatus({
         running: e.payload.running,
         addr: e.payload.addr ?? null,
         shares: e.payload.shares ?? [],
+        connections: e.payload.connections ?? [],
       });
       if (e.payload.message) setError(e.payload.message);
     });
     return () => {
+      clearInterval(statusTimer);
       un.then((fn) => fn());
     };
   }, []);
@@ -104,11 +116,11 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
     try {
       const p = parsePort();
       if (folders.length === 0) throw new Error("请至少选择一个要共享的文件夹");
-      const st = await api.serverStart(ip.trim() || "0.0.0.0", p, folders);
+      const st = await api.serverStart(ip.trim() || "0.0.0.0", p, folders, scanWorkers);
       setStatus(st);
       // auto-save a config so it's easy to restore later
       const name = folders[0].split(/[\\/]/).filter(Boolean).pop() || "共享文件夹";
-      await api.saveServerConfig(name, ip.trim() || "0.0.0.0", p, folders);
+      await api.saveServerConfig(name, ip.trim() || "0.0.0.0", p, folders, scanWorkers);
       await refreshSaved();
     } catch (e) {
       setError(String(e));
@@ -135,6 +147,7 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
     setIp(cfg.ip);
     setPort(String(cfg.port));
     setFolders(cfg.folders);
+    setScanWorkers(cfg.scanWorkers ?? 0);
     setSelectedId(id);
   };
 
@@ -220,6 +233,25 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
           </Button>
         </div>
 
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-xs">
+            <Label>扫描并发数</Label>
+            <span className="font-mono text-muted-foreground">
+              {scanWorkers === 0 ? "自动" : `${scanWorkers} 线程`}
+            </span>
+          </div>
+          <Slider
+            min={0}
+            max={32}
+            step={1}
+            value={[scanWorkers]}
+            onValueChange={(v) => setScanWorkers(v[0])}
+          />
+          <p className="text-[10px] text-muted-foreground">
+            0 = 自动（按本机 CPU 一半）；扫描超大目录时可适当调高并发
+          </p>
+        </div>
+
         <div className="space-y-1">
           <Label className="text-xs">已保存配置</Label>
           <div className="flex gap-2">
@@ -247,7 +279,7 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
                   const p = parsePort();
                   if (folders.length === 0) throw new Error("请先添加共享文件夹");
                   const name = folders[0].split(/[\\/]/).filter(Boolean).pop() || "共享文件夹";
-                  await api.saveServerConfig(name, ip.trim() || "0.0.0.0", p, folders);
+                  await api.saveServerConfig(name, ip.trim() || "0.0.0.0", p, folders, scanWorkers);
                   await refreshSaved();
                 } catch (e) {
                   setError(String(e));
