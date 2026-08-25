@@ -30,7 +30,7 @@ import {
 } from "@/components/ui/select";
 
 function defaultStatus(): ServerStatus {
-  return { running: false, addr: null, shares: [] };
+  return { running: false, addr: null, shares: [], connections: [] };
 }
 
 interface ServerPanelProps {
@@ -59,15 +59,25 @@ export default function ServerPanel({ collapsed, onToggleCollapsed }: ServerPane
 
   useEffect(() => {
     refreshSaved();
+    const refreshStatus = () => {
+      api.serverStatus().then(setStatus).catch(() => {
+        /* 服务端未启动或应用正在退出 */
+      });
+    };
+    refreshStatus();
+    const statusTimer = setInterval(refreshStatus, 1000);
+
     const un = listen<ServerEvent>(EVT_SERVER, (e) => {
       setStatus({
         running: e.payload.running,
         addr: e.payload.addr ?? null,
         shares: e.payload.shares ?? [],
+        connections: e.payload.connections ?? [],
       });
       if (e.payload.message) setError(e.payload.message);
     });
     return () => {
+      clearInterval(statusTimer);
       un.then((fn) => fn());
     };
   }, []);

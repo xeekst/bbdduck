@@ -15,8 +15,13 @@ pub fn list_shares(ip: &str, port: u16) -> Result<Vec<String>, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
-    write_msg(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-        .map_err(|e| e.to_string())?;
+    write_msg(
+        &mut stream,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     match read_msg::<_, ServerMsg>(&mut stream).map_err(|e| e.to_string())? {
         Some(ServerMsg::HelloAck { .. }) => {}
         Some(ServerMsg::Error { message }) => return Err(message),
@@ -31,23 +36,28 @@ pub fn list_shares(ip: &str, port: u16) -> Result<Vec<String>, String> {
 }
 
 /// Streams the file listing of a remote share. `on_entry` returns `false` to
-/// abort the scan early. Returns `(total_files, total_bytes)`.
+/// abort the scan early. Returns `(total_files, total_bytes, skipped_paths)`.
 pub fn list_remote_files(
     ip: &str,
     port: u16,
     share: &str,
     mut on_entry: impl FnMut(&FileEntry) -> bool,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, u64), String> {
     // Connect timeout is generous (15s) so a link saturated by many download
-    // connections does not abort the scan; the 900s read timeout is per-read,
+    // connections does not abort the scan; the 120s read timeout is per-read,
     // not a total budget — the server streams batches continuously, so even a
-    // multi-hour listing is fine, and the margin only guards against stalls.
+    // multi-hour listing is fine, while a silent stalled scan is surfaced.
     let mut stream = connect_with_timeout(ip, port, 15)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(900)))
+        .set_read_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
-    write_msg(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-        .map_err(|e| e.to_string())?;
+    write_msg(
+        &mut stream,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     match read_msg::<_, ServerMsg>(&mut stream).map_err(|e| e.to_string())? {
         Some(ServerMsg::HelloAck { .. }) => {}
         Some(ServerMsg::Error { message }) => return Err(message),
@@ -67,12 +77,16 @@ pub fn list_remote_files(
             Some(ServerMsg::FileEntries { entries }) => {
                 for e in entries {
                     if !on_entry(&e) {
-                        return Ok((0, 0));
+                        return Ok((0, 0, 0));
                     }
                 }
             }
-            Some(ServerMsg::FileEntriesEnd { total, total_bytes }) => {
-                return Ok((total, total_bytes));
+            Some(ServerMsg::FileEntriesEnd {
+                total,
+                total_bytes,
+                skipped_paths,
+            }) => {
+                return Ok((total, total_bytes, skipped_paths));
             }
             Some(ServerMsg::Error { message }) => return Err(message),
             _ => return Err("服务器响应异常".into()),

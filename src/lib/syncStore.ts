@@ -3,7 +3,7 @@ import type { FileProgressEvent, JobEvent, LogEvent, RetryEvent } from "./sync-t
 /** Hard caps so the UI stays fast even for hundreds of TB of files. */
 export const MAX_ROWS = 50000;
 export const MAX_TREE_FILES = 200000;
-export const MAX_LOGS = 1000;
+export const MAX_LOGS = 5000;
 
 export interface TransferRow {
   key: string;
@@ -16,8 +16,10 @@ export interface TransferRow {
 
 export interface LogEntry {
   time: number;
+  source: "client" | "server";
   level: "info" | "warn" | "error";
   message: string;
+  file?: string | null;
 }
 
 export interface RetryItem {
@@ -154,13 +156,20 @@ class SyncStore {
     const key = p.path;
     let row = this.rowMap.get(key);
     if (row) {
-      const wasDone = row.status === "done";
+      const previousStatus = row.status;
+      const nextStatus = p.done >= p.total ? "done" : "active";
       row.done = p.done;
       row.total = p.total;
       row.speed = p.speed;
-      row.status = p.done >= p.total ? "done" : "active";
-      if (!wasDone && row.status === "done") {
+      row.status = nextStatus;
+      if (previousStatus === "active" && nextStatus !== "active") {
         this.activeCount = Math.max(0, this.activeCount - 1);
+      } else if (previousStatus !== "active" && nextStatus === "active") {
+        this.activeCount++;
+      }
+      if (previousStatus === "done" && nextStatus !== "done") {
+        this.doneCount = Math.max(0, this.doneCount - 1);
+      } else if (previousStatus !== "done" && nextStatus === "done") {
         this.doneCount++;
       }
     } else {
@@ -236,6 +245,12 @@ class SyncStore {
         maxRetries: e.maxRetries,
         retryAt: Date.now() + e.retryIn * 1000,
       });
+      const row = this.rowMap.get(e.path);
+      if (row?.status === "active") {
+        this.activeCount = Math.max(0, this.activeCount - 1);
+        row.status = "error";
+        row.speed = 0;
+      }
     }
     this.bump();
   }
@@ -270,5 +285,5 @@ class SyncStore {
 
 export const syncStore = new SyncStore();
 
-// ---- Log payload from the backend (LogEvent) is { id, level, message, time } ----
+// ---- Log payloads are also persisted by the backend in UTC-dated files. ----
 export type { LogEvent };

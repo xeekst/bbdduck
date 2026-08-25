@@ -15,10 +15,7 @@ use bbdduck_lib::sync::protocol::{
 use bbdduck_lib::sync::server::ServerHandle;
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bbdduck-test-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("bbdduck-test-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -54,9 +51,10 @@ fn server_lists_and_streams_files() {
             0,
         )
         .expect("start server");
-    let (ip, port) = addr.rsplit_once(':').map(|(i, p)| {
-        (i.to_string(), p.parse::<u16>().expect("port"))
-    }).unwrap();
+    let (ip, port) = addr
+        .rsplit_once(':')
+        .map(|(i, p)| (i.to_string(), p.parse::<u16>().expect("port")))
+        .unwrap();
 
     // 1. list shares
     let shares = list_shares(&ip, port).expect("list_shares");
@@ -64,7 +62,7 @@ fn server_lists_and_streams_files() {
 
     // 2. list remote files (streamed)
     let mut entries: Vec<FileEntry> = Vec::new();
-    let (total, total_bytes) = list_remote_files(&ip, port, &shares[0], |e| {
+    let (total, total_bytes, skipped_paths) = list_remote_files(&ip, port, &shares[0], |e| {
         entries.push(e.clone());
         true
     })
@@ -73,6 +71,7 @@ fn server_lists_and_streams_files() {
     assert_eq!(total, files.len() as u64);
     let expected_bytes: u64 = files.iter().map(|(_, s)| s).sum();
     assert_eq!(total_bytes, expected_bytes);
+    assert_eq!(skipped_paths, 0);
 
     // every file must be present in the listing
     for (name, size) in &files {
@@ -88,7 +87,13 @@ fn server_lists_and_streams_files() {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
-    write_msg(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION }).unwrap();
+    write_msg(
+        &mut stream,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
     let _ack = read_msg::<_, ServerMsg>(&mut stream).unwrap().unwrap();
     let target = files[1].0.clone(); // sub/b.bin (100_000 bytes)
     write_msg(
@@ -114,7 +119,13 @@ fn server_lists_and_streams_files() {
 
     // 4. path traversal is rejected
     let mut stream2 = connect_with_timeout(&ip, port, 5).expect("connect");
-    write_msg(&mut stream2, &ClientMsg::Hello { version: PROTOCOL_VERSION }).unwrap();
+    write_msg(
+        &mut stream2,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
     let _ = read_msg::<_, ServerMsg>(&mut stream2).unwrap().unwrap();
     write_msg(
         &mut stream2,
@@ -146,6 +157,9 @@ fn incremental_mtime_rule() {
     fs::write(&p, b"data").unwrap();
     let md = fs::metadata(&p).unwrap();
     let secs = mtime_secs(&md);
-    assert!(secs > 1_600_000_000, "mtime should be a unix timestamp, got {secs}");
+    assert!(
+        secs > 1_600_000_000,
+        "mtime should be a unix timestamp, got {secs}"
+    );
     let _ = fs::remove_dir_all(&d);
 }

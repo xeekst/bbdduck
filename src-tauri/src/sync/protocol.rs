@@ -21,12 +21,29 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    HelloAck { version: u32, name: String },
-    Shares { shares: Vec<String> },
-    FileEntries { entries: Vec<FileEntry> },
-    FileEntriesEnd { total: u64, total_bytes: u64 },
-    FileMeta { size: u64, mtime: i64 },
-    Error { message: String },
+    HelloAck {
+        version: u32,
+        name: String,
+    },
+    Shares {
+        shares: Vec<String>,
+    },
+    FileEntries {
+        entries: Vec<FileEntry>,
+    },
+    FileEntriesEnd {
+        total: u64,
+        total_bytes: u64,
+        #[serde(default)]
+        skipped_paths: u64,
+    },
+    FileMeta {
+        size: u64,
+        mtime: i64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +78,9 @@ pub fn read_msg<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Result<
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf).map(Some).map_err(io::Error::other)
+    serde_json::from_slice(&buf)
+        .map(Some)
+        .map_err(io::Error::other)
 }
 
 /// Resolve a relative path against a root, rejecting anything that would

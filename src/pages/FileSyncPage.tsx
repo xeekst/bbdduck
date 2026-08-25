@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { FolderSync } from "lucide-react";
+import { FolderSync, MonitorDown, Server } from "lucide-react";
 import { api } from "@/lib/api";
 import {
   EVT_FILES_DELETED,
@@ -28,6 +28,7 @@ import SyncProgressList from "@/components/sync/SyncProgressList";
 import CompletedTreeView from "@/components/sync/CompletedTreeView";
 import RetryQueueView from "@/components/sync/RetryQueueView";
 import SyncLogView from "@/components/sync/SyncLogView";
+import ServerConnectionsView from "@/components/sync/ServerConnectionsView";
 
 function TabCount({ kind }: { kind: "active" | "done" | "retry" }) {
   useSyncExternalStore(syncStore.subscribe, syncStore.getSnapshot);
@@ -56,6 +57,8 @@ function FileSyncPage() {
   const [stopping, setStopping] = useState(false);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  const [tab, setTab] = useState("transfer");
+  const [panelMode, setPanelMode] = useState<"client" | "server">("client");
 
   useEffect(() => {
     const un: Promise<() => void>[] = [];
@@ -79,6 +82,10 @@ function FileSyncPage() {
           // instead of instantly resetting to "尚未开始同步".
           syncStore.setJob(job);
           syncStore.finish();
+          if (job.status === "error") {
+            setPanelMode("client");
+            setTab("log");
+          }
         }
       })
     );
@@ -113,11 +120,14 @@ function FileSyncPage() {
 
     un.push(
       listen<LogEvent>(EVT_LOG, (e) => {
-        if (e.payload.id !== jobIdRef.current) return;
+        const source = e.payload.source ?? "client";
+        if (source === "client" && jobIdRef.current && e.payload.id !== jobIdRef.current) return;
         syncStore.addLog({
           time: e.payload.time * 1000,
+          source,
           level: e.payload.level,
           message: e.payload.message,
+          file: e.payload.file,
         });
       })
     );
@@ -128,7 +138,9 @@ function FileSyncPage() {
   }, []);
 
   const handleStart = async (opts: SyncOptions) => {
+    const requestStartedAt = Date.now();
     const jid = await api.syncStart(opts);
+    const earlyLogs = syncStore.logs.filter((entry) => entry.time >= requestStartedAt);
     jobIdRef.current = jid;
     terminalRef.current = false; // new job: allow running events again
     syncStore.reset(jid, {
@@ -136,6 +148,15 @@ function FileSyncPage() {
       localDir: opts.localDir,
       startedAt: Date.now(),
     });
+    earlyLogs.forEach((entry) => syncStore.addLog(entry));
+    syncStore.addLog({
+      time: Date.now(),
+      source: "client",
+      level: "info",
+      message: "同步任务已创建，正在连接服务端并扫描远端目录",
+    });
+    setTab("transfer");
+    setPanelMode("client");
     setRunning(false);
     setSyncing(true);
     setStopping(false);
@@ -179,64 +200,94 @@ function FileSyncPage() {
       </div>
 
       <Card className="flex min-h-0 flex-1 flex-col gap-0 py-3">
-        <CardHeader className="px-4 py-0">
-          <SyncSummaryBar startedAt={startedAt} />
-        </CardHeader>
-        <CardContent className="flex min-h-0 flex-1 flex-col gap-0 px-4 pt-2">
-          <Tabs defaultValue="transfer" className="flex min-h-0 flex-1 flex-col gap-2">
-            <TabsList>
-              <TabsTrigger value="transfer">
-                正在传输
-                <TabCount kind="active" />
+        <Tabs
+          value={panelMode}
+          onValueChange={(value) => setPanelMode(value as "client" | "server")}
+          className="min-h-0 flex-1 gap-0"
+        >
+          <CardHeader className="gap-2 px-4 py-0">
+            <TabsList className="h-8 justify-self-start">
+              <TabsTrigger value="client" className="text-xs">
+                <MonitorDown className="size-3.5" /> 客户端
               </TabsTrigger>
-              <TabsTrigger value="done">
-                已完成目录
-                <TabCount kind="done" />
+              <TabsTrigger value="server" className="text-xs">
+                <Server className="size-3.5" /> 服务端
               </TabsTrigger>
-              <TabsTrigger value="retry">
-                重试队列
-                <TabCount kind="retry" />
-              </TabsTrigger>
-              <TabsTrigger value="log">日志</TabsTrigger>
             </TabsList>
+            <div className="min-w-0 pt-0.5">
+              {panelMode === "client" ? (
+                <SyncSummaryBar startedAt={startedAt} />
+              ) : (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Server className="size-4 text-primary" />
+                  客户端连接、正在发送的文件与最近活动
+                </div>
+              )}
+            </div>
+          </CardHeader>
 
-            <TabsContent
-              value="transfer"
-              className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
-            >
-              <div className="absolute inset-0">
-                <SyncProgressList />
-              </div>
+          <CardContent className="flex min-h-0 flex-1 flex-col gap-0 px-4 pt-2">
+            <TabsContent value="client" className="mt-0 flex min-h-0 flex-1 flex-col">
+              <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col gap-2">
+                <TabsList>
+                  <TabsTrigger value="transfer">
+                    正在传输
+                    <TabCount kind="active" />
+                  </TabsTrigger>
+                  <TabsTrigger value="done">
+                    已完成目录
+                    <TabCount kind="done" />
+                  </TabsTrigger>
+                  <TabsTrigger value="retry">
+                    重试队列
+                    <TabCount kind="retry" />
+                  </TabsTrigger>
+                  <TabsTrigger value="log">日志</TabsTrigger>
+                </TabsList>
+
+                <TabsContent
+                  value="transfer"
+                  className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
+                >
+                  <div className="absolute inset-0">
+                    <SyncProgressList />
+                  </div>
+                </TabsContent>
+
+                <TabsContent
+                  value="done"
+                  className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
+                >
+                  <div className="absolute inset-0">
+                    <CompletedTreeView />
+                  </div>
+                </TabsContent>
+
+                <TabsContent
+                  value="retry"
+                  className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
+                >
+                  <div className="absolute inset-0">
+                    <RetryQueueView />
+                  </div>
+                </TabsContent>
+
+                <TabsContent
+                  value="log"
+                  className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
+                >
+                  <div className="absolute inset-0">
+                    <SyncLogView />
+                  </div>
+                </TabsContent>
+              </Tabs>
             </TabsContent>
 
-            <TabsContent
-              value="done"
-              className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
-            >
-              <div className="absolute inset-0">
-                <CompletedTreeView />
-              </div>
+            <TabsContent value="server" className="mt-0 min-h-0 flex-1">
+              <ServerConnectionsView />
             </TabsContent>
-
-            <TabsContent
-              value="retry"
-              className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
-            >
-              <div className="absolute inset-0">
-                <RetryQueueView />
-              </div>
-            </TabsContent>
-
-            <TabsContent
-              value="log"
-              className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-muted/20"
-            >
-              <div className="absolute inset-0">
-                <SyncLogView />
-              </div>
-            </TabsContent>
-          </Tabs>
-        </CardContent>
+          </CardContent>
+        </Tabs>
       </Card>
     </div>
   );

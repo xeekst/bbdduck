@@ -1,4 +1,5 @@
 pub mod db;
+pub mod file_occupancy;
 pub mod net_tool;
 pub mod ssh_tunnel;
 pub mod sync;
@@ -48,6 +49,13 @@ impl JobHandle {
             total_bytes: p.total_bytes,
             done_bytes: p.done_bytes,
             speed: p.speed,
+            scanned_files: p.scanned_files,
+            active_files: p.active_files,
+            listing_complete: p.listing_complete,
+            list_attempt: p.list_attempt,
+            phase: p.phase.clone(),
+            activity: p.activity.clone(),
+            current_file: p.current_file.clone(),
             error: p.error.clone(),
             started_at: self.started_at,
             finished_at: *self.finished_at.lock().unwrap(),
@@ -73,12 +81,22 @@ fn server_start(
     folders: Vec<String>,
     scan_workers: usize,
 ) -> Result<ServerStatus, String> {
-    let addr = state.server.start(ip, port, folders, scan_workers)?;
+    let addr = match state
+        .server
+        .start_with_app(app.clone(), ip, port, folders, scan_workers)
+    {
+        Ok(addr) => addr,
+        Err(error) => {
+            sync::logging::server_error(&app, format!("同步服务端启动失败：{error}"));
+            return Err(error);
+        }
+    };
     let shares = state.server.shares();
     let status = ServerStatus {
         running: true,
         addr: Some(addr.clone()),
         shares: shares.clone(),
+        connections: state.server.connections(),
     };
     let _ = app.emit(
         EVT_SERVER,
@@ -86,9 +104,11 @@ fn server_start(
             running: true,
             addr: Some(addr),
             shares,
+            connections: state.server.connections(),
             message: None,
         },
     );
+    sync::logging::server_info(&app, format!("同步服务端已启动，监听 {}", status.addr.as_deref().unwrap_or("-")));
     Ok(status)
 }
 
@@ -101,9 +121,11 @@ fn server_stop(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), St
             running: false,
             addr: None,
             shares: vec![],
+            connections: vec![],
             message: None,
         },
     );
+    sync::logging::server_info(&app, "同步服务端已停止");
     Ok(())
 }
 
@@ -113,6 +135,7 @@ fn server_status(state: State<'_, Arc<AppState>>) -> ServerStatus {
         running: state.server.is_running(),
         addr: state.server.addr(),
         shares: state.server.shares(),
+        connections: state.server.connections(),
     }
 }
 
@@ -128,7 +151,7 @@ async fn client_list_shares(ip: String, port: u16) -> Result<Vec<String>, String
 #[tauri::command]
 async fn client_remote_info(ip: String, port: u16, share: String) -> Result<RemoteInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (total_files, total_bytes) =
+        let (total_files, total_bytes, _skipped_paths) =
             sync::client::list_remote_files(&ip, port, &share, |_| true)?;
         Ok::<RemoteInfo, String>(RemoteInfo {
             total_files,
@@ -185,6 +208,13 @@ fn sync_start(
                 total_bytes: p.total_bytes,
                 done_bytes: p.done_bytes,
                 speed: 0,
+                scanned_files: p.scanned_files,
+                active_files: p.active_files,
+                listing_complete: p.listing_complete,
+                list_attempt: p.list_attempt,
+                phase: p.phase.clone(),
+                activity: p.activity.clone(),
+                current_file: p.current_file.clone(),
                 message: summary.error.clone().or_else(|| summary.message.clone()),
             }
         };
@@ -232,7 +262,11 @@ async fn sync_stop(app: AppHandle, job_id: String) -> Result<(), String> {
 
         // Report "stopped" immediately so the UI resets right away, even while
         // the engine is still unwinding its threads in the background.
-        let p = job.progress.lock().unwrap();
+        let mut p = job.progress.lock().unwrap();
+        p.phase = "stopped".into();
+        p.activity = "正在停止同步…".into();
+        p.current_file = None;
+        p.active_files = 0;
         let payload = JobEventPayload {
             id: job_id.clone(),
             status: JobStatus::Stopped,
@@ -243,19 +277,18 @@ async fn sync_stop(app: AppHandle, job_id: String) -> Result<(), String> {
             total_bytes: p.total_bytes,
             done_bytes: p.done_bytes,
             speed: 0,
+            scanned_files: p.scanned_files,
+            active_files: p.active_files,
+            listing_complete: p.listing_complete,
+            list_attempt: p.list_attempt,
+            phase: p.phase.clone(),
+            activity: p.activity.clone(),
+            current_file: p.current_file.clone(),
             message: Some("正在停止同步…".into()),
         };
         drop(p);
         let _ = app.emit(EVT_JOB, payload);
-        let _ = app.emit(
-            EVT_LOG,
-            LogPayload {
-                id: job_id.clone(),
-                level: "info".into(),
-                message: "正在停止同步…".into(),
-                time: now_secs(),
-            },
-        );
+        engine::log_info(&app, &job_id, "正在停止同步…");
     }
     Ok(())
 }
@@ -326,6 +359,22 @@ fn list_recent_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<Recent
         .db
         .list_recent_connections()
         .map_err(|e| e.to_string())
+}
+
+// ---------------- local file occupancy ----------------
+
+#[tauri::command]
+async fn file_occupancy_scan(query: String) -> Result<file_occupancy::OccupancyScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || file_occupancy::scan(query))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn file_occupancy_terminate(pid: u32, process_token: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || file_occupancy::terminate(pid, process_token))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 // ---------------- network tools ----------------
@@ -468,6 +517,8 @@ pub fn run() {
             delete_server_config,
             save_recent_connection,
             list_recent_connections,
+            file_occupancy_scan,
+            file_occupancy_terminate,
             net_local_info,
             net_tcp_probe,
             net_ping,
