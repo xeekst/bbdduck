@@ -130,7 +130,7 @@ function Sidebar() {
       >
         {!collapsed && (
           <span className="flex-1 truncate px-1 text-sm font-semibold tracking-wide">
-            bbdduck
+            bbq-duck
           </span>
         )}
         <Button

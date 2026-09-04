@@ -40,7 +40,7 @@ fn server_info(app: Option<&AppHandle>, message: impl Into<String>) {
     if let Some(app) = app {
         logging::server_info(app, message);
     } else {
-        eprintln!("[bbdduck-server] {message}");
+        eprintln!("[bbq-duck-server] {message}");
     }
 }
 
@@ -49,7 +49,7 @@ fn server_warn(app: Option<&AppHandle>, message: impl Into<String>) {
     if let Some(app) = app {
         logging::server_warn(app, message);
     } else {
-        eprintln!("[bbdduck-server] WARN {message}");
+        eprintln!("[bbq-duck-server] WARN {message}");
     }
 }
 
@@ -58,7 +58,7 @@ fn server_error(app: Option<&AppHandle>, message: impl Into<String>) {
     if let Some(app) = app {
         logging::server_error(app, message);
     } else {
-        eprintln!("[bbdduck-server] ERROR {message}");
+        eprintln!("[bbq-duck-server] ERROR {message}");
     }
 }
 
@@ -293,7 +293,7 @@ fn handle_connection(
                 &mut stream,
                 &ServerMsg::HelloAck {
                     version: PROTOCOL_VERSION,
-                    name: "bbdduck".into(),
+                    name: "bbq-duck".into(),
                 },
             );
         }
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn missing_directory_is_skipped_without_stopping_the_scan() {
         let missing =
-            std::env::temp_dir().join(format!("bbdduck-missing-scan-path-{}", std::process::id()));
+            std::env::temp_dir().join(format!("bbq-duck-missing-scan-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
         let (dir_tx, _dir_rx) = unbounded::<PathBuf>();
         let (entry_tx, entry_rx) = bounded::<FileEntry>(8);

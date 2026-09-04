@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    bbdduck_lib::run()
+    bbq_duck_lib::run()
 }

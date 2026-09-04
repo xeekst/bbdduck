@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn finds_an_open_file_handle_by_fuzzy_name() {
         let marker = format!(
-            "bbdduck_handle_marker_{}_{}.tmp",
+            "bbq_duck_handle_marker_{}_{}.tmp",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

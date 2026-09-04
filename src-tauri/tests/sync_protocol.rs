@@ -7,15 +7,15 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bbdduck_lib::sync::client::{list_remote_files, list_shares};
-use bbdduck_lib::sync::protocol::{
+use bbq_duck_lib::sync::client::{list_remote_files, list_shares};
+use bbq_duck_lib::sync::protocol::{
     connect_with_timeout, mtime_secs, read_msg, safe_join, write_msg, ClientMsg, FileEntry,
     ServerMsg, PROTOCOL_VERSION,
 };
-use bbdduck_lib::sync::server::ServerHandle;
+use bbq_duck_lib::sync::server::ServerHandle;
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bbdduck-test-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bbq-duck-test-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir

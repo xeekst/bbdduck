@@ -1563,7 +1563,7 @@ mod tests {
     #[test]
     fn mirror_manifest_is_disk_backed_and_cleaned_up() {
         let path = std::env::temp_dir().join(format!(
-            "bbdduck-mirror-manifest-test-{}.sqlite",
+            "bbq-duck-mirror-manifest-test-{}.sqlite",
             std::process::id()
         ));
         let _ = fs::remove_file(&path);
@@ -1586,7 +1586,7 @@ mod tests {
     #[test]
     fn scan_manifest_tracks_exact_paths_and_is_cleaned_up() {
         let path = std::env::temp_dir().join(format!(
-            "bbdduck-scan-manifest-test-{}.sqlite",
+            "bbq-duck-scan-manifest-test-{}.sqlite",
             std::process::id()
         ));
         let _ = fs::remove_file(&path);
@@ -1609,7 +1609,7 @@ mod tests {
 
     #[test]
     fn delete_missing_removes_leftovers_keeps_mirrored() {
-        let root = std::env::temp_dir().join(format!("bbdduck-del-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("bbq-duck-del-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("keep/sub")).unwrap();
         fs::write(root.join("keep/a.txt"), b"a").unwrap();

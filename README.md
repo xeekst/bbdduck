@@ -1,6 +1,6 @@
-# bbdduck
+# bbq-duck
 
-bbdduck 是一个面向桌面端的网络与文件操作工具，使用 Tauri 2 + React + TypeScript 构建。当前提供跨服务器文件夹同步、网络连通性诊断和 SSH 端口转发能力。
+bbq-duck 是一个面向桌面端的网络与文件操作工具，使用 Tauri 2 + React + TypeScript 构建。当前提供跨服务器文件夹同步、网络连通性诊断和 SSH 端口转发能力。
 
 ## 功能说明
 
@@ -41,7 +41,7 @@ bbdduck 是一个面向桌面端的网络与文件操作工具，使用 Tauri 2 
 
 ### 4. 本地数据
 
-应用使用 SQLite 保存本地数据，数据库文件名为 `bbdduck.db`，位于 Tauri 的应用数据目录。当前保存：
+应用使用 SQLite 保存本地数据，数据库文件名为 `bbq-duck.db`，位于 Tauri 的应用数据目录。首次运行新版本时会自动迁移旧版 `bbdduck.db` 和应用数据目录。当前保存：
 
 - 节点 A 共享配置；
 - 最近连接记录；
@@ -82,7 +82,7 @@ bbdduck 是一个面向桌面端的网络与文件操作工具，使用 Tauri 2 
 │          ├──────── sync engine / TCP protocol                │
 │          ├──────── network inspection / probe                │
 │          ├──────── SSH runtime / forwarding                  │
-│          └──────── SQLite (`bbdduck.db`)                     │
+│          └──────── SQLite (`bbq-duck.db`)                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -184,7 +184,7 @@ bbdduck 是一个面向桌面端的网络与文件操作工具，使用 Tauri 2 
 
 ## 开发与构建
 
-环境要求：Node.js、pnpm、Rust、Cargo，以及 Tauri 2 对应的系统依赖。Windows 打包使用 WebView2 fixed runtime 配置。
+环境要求：Node.js、pnpm、Rust、Cargo，以及 Tauri 2 对应的系统依赖。Windows 开发和打包可选择本机 WebView2 或固定版本运行时。
 
 ```bash
 # 安装依赖
@@ -196,11 +196,17 @@ pnpm dev
 # 启动 Tauri 桌面开发环境
 pnpm tauri
 
+# 使用固定版本 WebView2 启动开发环境
+pnpm tauri:fixed
+
 # 类型检查并构建前端 dist
 pnpm build
 
 # 构建 Tauri 应用
 pnpm build:prod
+
+# 携带固定版本 WebView2 构建
+pnpm build:fixed
 
 # 生成 Windows 可执行文件或安装包
 pnpm build:exe
@@ -223,7 +229,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## 注意事项
 
-- 文件同步服务端是应用内置的自定义 TCP 服务，不是 SMB/NFS；两端都需要运行 bbdduck，节点 B 连接节点 A 的监听端口。
+- 文件同步服务端是应用内置的自定义 TCP 服务，不是 SMB/NFS；两端都需要运行 bbq-duck，节点 B 连接节点 A 的监听端口。
 - 共享目录路径和 SSH 凭据会保存在本机 SQLite 中，请根据本机安全要求保护应用数据目录。
 - 镜像删除是破坏性同步选项，启用前应确认远端目录是权威数据源，并做好备份。
 - 防火墙、端口占用、网络隔离和 ICMP 权限可能导致端口检测或 Ping 失败。

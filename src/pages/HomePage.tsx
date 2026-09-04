@@ -35,7 +35,7 @@ function HomePage() {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-8 p-8">
       <div className="text-center">
-        <h1 className="text-3xl font-bold tracking-tight">bbdduck</h1>
+        <h1 className="text-3xl font-bold tracking-tight">bbq-duck</h1>
         <p className="mt-2 text-sm text-muted-foreground">
           跨服务器文件夹快速同步工具 · Tauri + React + shadcn/ui
         </p>

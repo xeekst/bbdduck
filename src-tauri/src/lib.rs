@@ -413,7 +413,7 @@ mod completed_page_tests {
     #[test]
     fn pages_local_directory_without_collecting_every_entry() {
         let root = std::env::temp_dir().join(format!(
-            "bbdduck-completed-page-test-{}",
+            "bbq-duck-completed-page-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -617,6 +617,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
+            if let Err(error) = migrate_legacy_app_data_dir(&dir) {
+                eprintln!("[bbq-duck] WARN 迁移旧应用数据目录失败：{error}");
+            }
             let db =
                 Arc::new(Db::open(&dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?);
             let tunnels = Arc::new(ssh_tunnel::TunnelManager::new(
@@ -670,4 +673,27 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn migrate_legacy_app_data_dir(new_dir: &std::path::Path) -> std::io::Result<()> {
+    const LEGACY_IDENTIFIER: &str = "com.x1.bbdduck";
+
+    let Some(parent) = new_dir.parent() else {
+        return Ok(());
+    };
+    let legacy_dir = parent.join(LEGACY_IDENTIFIER);
+    if legacy_dir == new_dir || !legacy_dir.is_dir() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(new_dir)?;
+    for entry in std::fs::read_dir(&legacy_dir)? {
+        let entry = entry?;
+        let destination = new_dir.join(entry.file_name());
+        if !destination.exists() {
+            std::fs::rename(entry.path(), destination)?;
+        }
+    }
+    let _ = std::fs::remove_dir(&legacy_dir);
+    Ok(())
 }

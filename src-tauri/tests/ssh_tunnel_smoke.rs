@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bbdduck_lib::ssh_tunnel::manager::TunnelRuntime;
-use bbdduck_lib::ssh_tunnel::model::{AuthKind, TunnelConfig, TunnelProto, TunnelType};
-use bbdduck_lib::ssh_tunnel::runner::{self, TunnelEvents};
+use bbq_duck_lib::ssh_tunnel::manager::TunnelRuntime;
+use bbq_duck_lib::ssh_tunnel::model::{AuthKind, TunnelConfig, TunnelProto, TunnelType};
+use bbq_duck_lib::ssh_tunnel::runner::{self, TunnelEvents};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 测试专用主机密钥（仅用于本测试的本地 SSH 服务器）

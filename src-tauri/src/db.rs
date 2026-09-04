@@ -82,7 +82,23 @@ CREATE INDEX IF NOT EXISTS idx_ssh_tunnel_logs ON ssh_tunnel_logs (tunnel_id, id
 impl Db {
     pub fn open(dir: &Path) -> rusqlite::Result<Self> {
         let _ = std::fs::create_dir_all(dir);
-        let conn = Connection::open(dir.join("bbdduck.db"))?;
+        let db_path = dir.join("bbq-duck.db");
+        let legacy_db_path = dir.join("bbdduck.db");
+        let db_path = if !db_path.exists() && legacy_db_path.exists() {
+            // Checkpoint a legacy WAL before renaming the database. If the
+            // rename fails, keep using the legacy path instead of losing data.
+            if let Ok(legacy_conn) = Connection::open(&legacy_db_path) {
+                let _ = legacy_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            }
+            if std::fs::rename(&legacy_db_path, &db_path).is_ok() {
+                db_path
+            } else {
+                legacy_db_path
+            }
+        } else {
+            db_path
+        };
+        let conn = Connection::open(db_path)?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         conn.execute_batch(SCHEMA)?;

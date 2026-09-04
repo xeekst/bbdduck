@@ -100,7 +100,7 @@ function App() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <AlertTriangle className="size-5 text-amber-600" />
-              确认退出 bbdduck？
+              确认退出 bbq-duck？
             </DialogTitle>
             <DialogDescription>
               退出后，正在运行的文件同步、共享监听和端口转发任务都会停止。
