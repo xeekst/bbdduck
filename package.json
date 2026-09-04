@@ -7,11 +7,17 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri dev",
-    "build:prod": "tauri build",
-    "build:exe": "tauri build --no-bundle",
-    "build:nsis": "tauri build --bundles nsis",
-    "build:msi": "tauri build --bundles msi"
+    "tauri": "tauri dev --config src-tauri/tauri.webview2-system.conf.json",
+    "tauri:system": "tauri dev --config src-tauri/tauri.webview2-system.conf.json",
+    "tauri:fixed": "tauri dev --config src-tauri/tauri.webview2-fixed.conf.json",
+    "build:prod": "tauri build --config src-tauri/tauri.webview2-system.conf.json",
+    "build:system": "tauri build --config src-tauri/tauri.webview2-system.conf.json",
+    "build:fixed": "tauri build --config src-tauri/tauri.webview2-fixed.conf.json",
+    "build:exe": "tauri build --config src-tauri/tauri.webview2-system.conf.json --no-bundle",
+    "build:nsis": "tauri build --config src-tauri/tauri.webview2-system.conf.json --bundles nsis",
+    "build:msi": "tauri build --config src-tauri/tauri.webview2-system.conf.json --bundles msi",
+    "build:nsis:fixed": "tauri build --config src-tauri/tauri.webview2-fixed.conf.json --bundles nsis",
+    "build:msi:fixed": "tauri build --config src-tauri/tauri.webview2-fixed.conf.json --bundles msi"
   },
   "dependencies": {
     "@radix-ui/react-collapsible": "^1.1.20",
