@@ -1,6 +1,7 @@
 pub mod db;
 pub mod file_occupancy;
 pub mod net_tool;
+pub mod port_occupancy;
 pub mod ssh_tunnel;
 pub mod sync;
 
@@ -108,7 +109,13 @@ fn server_start(
             message: None,
         },
     );
-    sync::logging::server_info(&app, format!("同步服务端已启动，监听 {}", status.addr.as_deref().unwrap_or("-")));
+    sync::logging::server_info(
+        &app,
+        format!(
+            "同步服务端已启动，监听 {}",
+            status.addr.as_deref().unwrap_or("-")
+        ),
+    );
     Ok(status)
 }
 
@@ -185,7 +192,11 @@ fn sync_start(
         finished_at: Mutex::new(None),
         thread: Mutex::new(None),
     });
-    state.jobs.lock().unwrap().insert(id.clone(), Arc::clone(&handle));
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(id.clone(), Arc::clone(&handle));
 
     let state2 = state.inner().clone();
     let app2 = app.clone();
@@ -312,6 +323,119 @@ fn sync_history(state: State<'_, Arc<AppState>>, limit: usize) -> Result<Vec<Job
         .map_err(|e| e.to_string())
 }
 
+fn completed_path(root: &std::path::Path, relative: &str) -> Result<std::path::PathBuf, String> {
+    let mut path = root.to_path_buf();
+    for component in std::path::Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err("目录路径不合法".into()),
+        }
+    }
+    Ok(path)
+}
+
+fn list_completed_page(
+    root: String,
+    relative: String,
+    offset: usize,
+    limit: usize,
+) -> Result<CompletedPage, String> {
+    let root = std::path::PathBuf::from(root);
+    let dir = completed_path(&root, &relative)?;
+    let page_size = limit.clamp(1, 500);
+    let read_dir = std::fs::read_dir(&dir)
+        .map_err(|e| format!("读取本地完成目录 {} 失败: {e}", dir.display()))?;
+    let mut entries = Vec::with_capacity(page_size + 1);
+    for item in read_dir.skip(offset) {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = if relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", relative.trim_end_matches('/'), name)
+        };
+        let metadata = entry.metadata().ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|value| value.modified().ok())
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64);
+        entries.push(CompletedEntry {
+            name,
+            path,
+            is_dir: file_type.is_dir(),
+            size: metadata.as_ref().map(|value| value.len()).unwrap_or(0),
+            modified,
+        });
+        if entries.len() > page_size {
+            break;
+        }
+    }
+    let has_more = entries.len() > page_size;
+    entries.truncate(page_size);
+    entries.sort_unstable_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(CompletedPage {
+        relative,
+        offset,
+        has_more,
+        entries,
+    })
+}
+
+#[tauri::command]
+async fn sync_list_completed(
+    root: String,
+    relative: String,
+    offset: usize,
+    limit: usize,
+) -> Result<CompletedPage, String> {
+    tauri::async_runtime::spawn_blocking(move || list_completed_page(root, relative, offset, limit))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod completed_page_tests {
+    use super::*;
+
+    #[test]
+    fn pages_local_directory_without_collecting_every_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "bbdduck-completed-page-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("b.txt"), b"bb").unwrap();
+        std::fs::write(root.join("c.txt"), b"ccc").unwrap();
+
+        let first =
+            list_completed_page(root.to_string_lossy().into_owned(), "".into(), 0, 2).unwrap();
+        assert_eq!(first.entries.len(), 2);
+        assert!(first.has_more);
+
+        let second =
+            list_completed_page(root.to_string_lossy().into_owned(), "".into(), 2, 2).unwrap();
+        assert_eq!(second.entries.len(), 2);
+        assert!(!second.has_more);
+        assert!(completed_path(&root, "../outside").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
 // ---------------- local sqlite storage ----------------
 
 #[tauri::command]
@@ -354,7 +478,9 @@ fn save_recent_connection(
 }
 
 #[tauri::command]
-fn list_recent_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<RecentConnection>, String> {
+fn list_recent_connections(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<RecentConnection>, String> {
     state
         .db
         .list_recent_connections()
@@ -375,6 +501,26 @@ async fn file_occupancy_terminate(pid: u32, process_token: String) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || file_occupancy::terminate(pid, process_token))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn port_occupancy_scan(port: u16) -> Result<port_occupancy::PortOccupancyScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || port_occupancy::scan(port))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn tcp_connection_stats(
+    port: u16,
+    source_ip: Option<String>,
+    local_ip: Option<String>,
+) -> Result<port_occupancy::TcpConnectionStatistics, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        port_occupancy::tcp_statistics(port, source_ip, local_ip)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ---------------- network tools ----------------
@@ -434,27 +580,18 @@ async fn ssh_tunnel_save(
 }
 
 #[tauri::command]
-async fn ssh_tunnel_start(
-    state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
+async fn ssh_tunnel_start(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     state.tunnels.start(id).await
 }
 
 #[tauri::command]
-async fn ssh_tunnel_stop(
-    state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
+async fn ssh_tunnel_stop(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     state.tunnels.stop(id).await;
     Ok(())
 }
 
 #[tauri::command]
-async fn ssh_tunnel_delete(
-    state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
+async fn ssh_tunnel_delete(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     state.tunnels.remove_runtime(id).await;
     state.db.delete_tunnel(id).map_err(|e| e.to_string())
 }
@@ -468,10 +605,7 @@ async fn ssh_tunnel_logs(
 }
 
 #[tauri::command]
-async fn ssh_tunnel_clear_logs(
-    state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
+async fn ssh_tunnel_clear_logs(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     state.tunnels.clear_logs(id).await;
     Ok(())
 }
@@ -483,7 +617,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            let db = Arc::new(Db::open(&dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?);
+            let db =
+                Arc::new(Db::open(&dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?);
             let tunnels = Arc::new(ssh_tunnel::TunnelManager::new(
                 app.handle().clone(),
                 db.clone(),
@@ -507,6 +642,7 @@ pub fn run() {
             server_stop,
             server_status,
             client_list_shares,
+            sync_list_completed,
             client_remote_info,
             sync_start,
             sync_stop,
@@ -519,6 +655,8 @@ pub fn run() {
             list_recent_connections,
             file_occupancy_scan,
             file_occupancy_terminate,
+            port_occupancy_scan,
+            tcp_connection_stats,
             net_local_info,
             net_tcp_probe,
             net_ping,

@@ -59,6 +59,7 @@ export default function ClientPanel({
   const [threads, setThreads] = useState(4);
   const [bandwidth, setBandwidth] = useState(0); // MB/s, 0 = unlimited
   const [incremental, setIncremental] = useState(true);
+  const [rescanOnInterrupt, setRescanOnInterrupt] = useState(false);
   const [deleteRemoved, setDeleteRemoved] = useState(false);
   const [connected, setConnected] = useState(false);
   const [remoteInfo, setRemoteInfo] = useState<RemoteInfo | null>(null);
@@ -174,6 +175,7 @@ export default function ClientPanel({
         threads,
         bandwidthMbps: bandwidth,
         incremental,
+        rescanOnInterrupt,
         deleteRemoved,
       });
     } catch (e) {
@@ -338,6 +340,28 @@ export default function ClientPanel({
             </div>
             <Switch checked={incremental} onCheckedChange={setIncremental} />
           </div>
+
+          <label
+            htmlFor="rescan-on-interrupt"
+            className="flex cursor-pointer items-start gap-2 rounded-md border border-border/70 px-2.5 py-2"
+          >
+            <input
+              id="rescan-on-interrupt"
+              type="checkbox"
+              checked={rescanOnInterrupt}
+              onChange={(event) => setRescanOnInterrupt(event.target.checked)}
+              className="mt-0.5 size-4 shrink-0 accent-primary"
+            />
+            <span className="min-w-0">
+              <span className="flex items-center gap-1.5 text-xs font-medium">
+                <RefreshCw className="size-3.5" />
+                扫描中断后自动重新扫描
+              </span>
+              <span className="mt-0.5 block text-[10px] leading-4 text-muted-foreground">
+                使用本机临时磁盘数据库记录已扫描路径；重扫时跳过重复路径，最多重试 30 次，任务结束后自动清理
+              </span>
+            </span>
+          </label>
 
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs">

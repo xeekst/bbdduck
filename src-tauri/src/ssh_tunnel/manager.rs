@@ -213,11 +213,9 @@ impl TunnelManager {
         for c in configs.into_iter().filter(|c| c.enabled) {
             let id = c.id;
             if let Err(e) = self.start(id).await {
-                let _ = self.db.append_tunnel_log(
-                    id,
-                    "error",
-                    &format!("开机自启失败: {e}"),
-                );
+                let _ = self
+                    .db
+                    .append_tunnel_log(id, "error", &format!("开机自启失败: {e}"));
             }
         }
     }

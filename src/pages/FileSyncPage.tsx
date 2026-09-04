@@ -3,15 +3,11 @@ import { listen } from "@tauri-apps/api/event";
 import { FolderSync, MonitorDown, Server } from "lucide-react";
 import { api } from "@/lib/api";
 import {
-  EVT_FILES_DELETED,
-  EVT_FILES_DONE,
   EVT_JOB,
   EVT_LOG,
   EVT_PROGRESS,
   EVT_RETRY,
   type FileProgressEvent,
-  type FilesDeletedEvent,
-  type FilesDoneEvent,
   type JobEvent,
   type LogEvent,
   type RetryEvent,
@@ -36,7 +32,7 @@ function TabCount({ kind }: { kind: "active" | "done" | "retry" }) {
     kind === "active"
       ? syncStore.activeCount
       : kind === "done"
-        ? syncStore.tree.count
+        ? (syncStore.job?.doneFiles ?? 0)
         : syncStore.retries.size;
   if (n <= 0) return null;
   return (
@@ -93,21 +89,7 @@ function FileSyncPage() {
     un.push(
       listen<FileProgressEvent>(EVT_PROGRESS, (e) => {
         if (e.payload.id !== jobIdRef.current) return;
-        syncStore.upsertProgress(e.payload);
-      })
-    );
-
-    un.push(
-      listen<FilesDoneEvent>(EVT_FILES_DONE, (e) => {
-        if (e.payload.id !== jobIdRef.current) return;
-        syncStore.addFilesDone(e.payload.files);
-      })
-    );
-
-    un.push(
-      listen<FilesDeletedEvent>(EVT_FILES_DELETED, (e) => {
-        if (e.payload.id !== jobIdRef.current) return;
-        syncStore.addDeleted(e.payload.files);
+        syncStore.replaceActiveProgress(e.payload.files);
       })
     );
 

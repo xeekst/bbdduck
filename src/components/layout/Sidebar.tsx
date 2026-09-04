@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
 import {
+  Activity,
   ArrowLeftRight,
   ChevronDown,
   ChevronRight,
@@ -9,6 +10,7 @@ import {
   FolderSync,
   PanelLeftClose,
   PanelLeftOpen,
+  Radar,
   RefreshCw,
   Settings,
   Wifi,
@@ -67,6 +69,18 @@ const GROUPS: NavGroup[] = [
         to: "/network",
         icon: RefreshCw,
         description: "TCP 端口连通性检测与 Ping",
+      },
+      {
+        label: "端口检测",
+        to: "/port-occupancy",
+        icon: Radar,
+        description: "检测本机端口占用、监听 IP 与进程树",
+      },
+      {
+        label: "TCP 连接统计",
+        to: "/tcp-statistics",
+        icon: Activity,
+        description: "按端口和 IP 统计 TCP 状态与连接详情",
       },
       {
         label: "端口转发",

@@ -88,7 +88,9 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         // migration for databases created before the local_dir column existed
         let has_local_dir = conn
-            .prepare("SELECT 1 FROM pragma_table_info('recent_connections') WHERE name = 'local_dir'")?
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('recent_connections') WHERE name = 'local_dir'",
+            )?
             .exists([])?;
         if !has_local_dir {
             conn.execute_batch(
@@ -97,7 +99,9 @@ impl Db {
         }
         // migration for databases created before the scan_workers column existed
         let has_scan_workers = conn
-            .prepare("SELECT 1 FROM pragma_table_info('server_configs') WHERE name = 'scan_workers'")?
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('server_configs') WHERE name = 'scan_workers'",
+            )?
             .exists([])?;
         if !has_scan_workers {
             conn.execute_batch(
@@ -203,7 +207,12 @@ impl Db {
 
     // ---------- sync jobs ----------
 
-    pub fn insert_job_start(&self, id: &str, opts: &SyncOptions, started_at: i64) -> rusqlite::Result<()> {
+    pub fn insert_job_start(
+        &self,
+        id: &str,
+        opts: &SyncOptions,
+        started_at: i64,
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sync_jobs (id, status, remote, share, local_dir, threads, incremental, started_at)
@@ -254,7 +263,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn list_job_history(&self, limit: usize) -> rusqlite::Result<Vec<crate::sync::model::JobSnapshot>> {
+    pub fn list_job_history(
+        &self,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<crate::sync::model::JobSnapshot>> {
         use crate::sync::model::{JobSnapshot, JobStatus};
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -401,11 +413,19 @@ impl Db {
     pub fn delete_tunnel(&self, id: i64) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM ssh_tunnels WHERE id = ?1", params![id])?;
-        conn.execute("DELETE FROM ssh_tunnel_logs WHERE tunnel_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM ssh_tunnel_logs WHERE tunnel_id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
-    pub fn append_tunnel_log(&self, tunnel_id: i64, level: &str, message: &str) -> rusqlite::Result<()> {
+    pub fn append_tunnel_log(
+        &self,
+        tunnel_id: i64,
+        level: &str,
+        message: &str,
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO ssh_tunnel_logs (tunnel_id, level, message, time) VALUES (?1, ?2, ?3, ?4)",

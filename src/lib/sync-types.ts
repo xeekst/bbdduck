@@ -12,6 +12,8 @@ export interface SyncOptions {
   /** Max total bandwidth in MB/s. 0 = unlimited. */
   bandwidthMbps: number;
   incremental: boolean;
+  /** Retry an interrupted remote scan, using a disk database to suppress duplicates. */
+  rescanOnInterrupt: boolean;
   /** When enabled, also delete local files/dirs that no longer exist on the remote. */
   deleteRemoved: boolean;
 }
@@ -130,23 +132,32 @@ export interface JobEvent {
   currentFile: string | null;
 }
 
-export interface FileProgressEvent {
-  id: string;
+export interface ActiveFileProgress {
   path: string;
   done: number;
   total: number;
   speed: number;
 }
 
-export interface FilesDoneEvent {
+export interface FileProgressEvent {
   id: string;
-  files: { path: string; size: number }[];
+  /** Complete bounded snapshot of files active at emit time. */
+  files: ActiveFileProgress[];
 }
 
-export interface FilesDeletedEvent {
-  id: string;
-  /** Relative paths of files/dirs deleted during mirror sync. */
-  files: string[];
+export interface CompletedEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  modified: number | null;
+}
+
+export interface CompletedPage {
+  relative: string;
+  offset: number;
+  hasMore: boolean;
+  entries: CompletedEntry[];
 }
 
 export interface RetryEvent {
@@ -157,7 +168,7 @@ export interface RetryEvent {
   /** Seconds until the next attempt. */
   retryIn: number;
   /** "retrying" while queued, "failed" when retries are exhausted. */
-  state: "retrying" | "failed";
+  state: "retrying" | "failed" | "succeeded";
 }
 
 export interface LogEvent {
@@ -172,7 +183,5 @@ export interface LogEvent {
 export const EVT_SERVER = "sync-server";
 export const EVT_JOB = "sync-job";
 export const EVT_PROGRESS = "sync-progress";
-export const EVT_FILES_DONE = "sync-files-done";
-export const EVT_FILES_DELETED = "sync-files-deleted";
 export const EVT_RETRY = "sync-retry";
 export const EVT_LOG = "sync-log";

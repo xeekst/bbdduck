@@ -1,17 +1,17 @@
-import type { FileProgressEvent, JobEvent, LogEvent, RetryEvent } from "./sync-types";
+import type {
+  ActiveFileProgress,
+  JobEvent,
+  LogEvent,
+  RetryEvent,
+} from "./sync-types";
 
-/** Hard caps so the UI stays fast even for hundreds of TB of files. */
-export const MAX_ROWS = 50000;
-export const MAX_TREE_FILES = 200000;
+/** UI state is bounded independently of the number of files in a sync job. */
 export const MAX_LOGS = 5000;
+export const MAX_RETRY_ITEMS = 10000;
 
-export interface TransferRow {
+export interface TransferRow extends ActiveFileProgress {
   key: string;
-  path: string;
-  done: number;
-  total: number;
-  speed: number;
-  status: "active" | "done" | "error" | "deleted";
+  status: "active";
 }
 
 export interface LogEntry {
@@ -30,68 +30,17 @@ export interface RetryItem {
   retryAt: number;
 }
 
-interface FileNode {
-  name: string;
-  size: number;
-}
-
-export interface DirNode {
-  name: string;
-  dirs: Map<string, DirNode>;
-  files: Map<string, FileNode>;
-  fileCount: number;
-  size: number;
-}
-
-function emptyDir(name: string): DirNode {
-  return { name, dirs: new Map(), files: new Map(), fileCount: 0, size: 0 };
-}
-
-class CompletedTree {
-  root: DirNode = emptyDir("");
-  count = 0;
-
-  reset() {
-    this.root = emptyDir("");
-    this.count = 0;
-  }
-
-  addFiles(files: { path: string; size: number }[]) {
-    for (const f of files) {
-      if (this.count >= MAX_TREE_FILES) return;
-      const parts = f.path.split("/").filter(Boolean);
-      if (parts.length === 0) continue;
-      let node = this.root;
-      for (let i = 0; i < parts.length - 1; i++) {
-        let next = node.dirs.get(parts[i]);
-        if (!next) {
-          next = emptyDir(parts[i]);
-          node.dirs.set(parts[i], next);
-        }
-        node = next;
-      }
-      const name = parts[parts.length - 1];
-      node.files.set(name, { name, size: f.size });
-      node.fileCount++;
-      node.size += f.size;
-      this.count++;
-    }
-  }
-}
-
 class SyncStore {
   version = 0;
   private listeners = new Set<() => void>();
   private notifyTimer: ReturnType<typeof setTimeout> | null = null;
 
   jobId: string | null = null;
+  /** Complete snapshot of currently active files; bounded by worker count. */
   rows: TransferRow[] = [];
-  private rowMap = new Map<string, TransferRow>();
-  tree = new CompletedTree();
   logs: LogEntry[] = [];
   job: JobEvent | null = null;
   activeCount = 0;
-  doneCount = 0;
   retries = new Map<string, RetryItem>();
   share: string | null = null;
   localDir: string | null = null;
@@ -108,14 +57,13 @@ class SyncStore {
   getSnapshot = () => this.version;
 
   private bump() {
-    // Coalesce rapid updates (e.g. progress events at high thread counts) into
-    // a single notification, so the UI re-renders at most ~20x/sec instead of
-    // once per event.
+    // Backend snapshots arrive at most twice per second. Keep a small coalescing
+    // window for job/log events that happen at the same time.
     if (this.notifyTimer) return;
     this.notifyTimer = setTimeout(() => {
       this.notifyTimer = null;
       this.version++;
-      for (const l of this.listeners) l();
+      for (const listener of this.listeners) listener();
     }, 50);
   }
 
@@ -129,18 +77,30 @@ class SyncStore {
     this.startedAt = meta?.startedAt ?? null;
     this.finishedAt = null;
     this.rows = [];
-    this.rowMap.clear();
-    this.tree.reset();
     this.logs = [];
     this.job = null;
     this.activeCount = 0;
-    this.doneCount = 0;
     this.retries.clear();
     this.bump();
   }
 
   setJob(job: JobEvent | null) {
     this.job = job;
+    if (!job || job.status !== "running") {
+      this.rows = [];
+      this.activeCount = 0;
+    }
+    this.bump();
+  }
+
+  /** Replace, rather than append, the complete active-transfer snapshot. */
+  replaceActiveProgress(files: ActiveFileProgress[]) {
+    this.rows = files.map((file) => ({
+      key: file.path,
+      status: "active" as const,
+      ...file,
+    }));
+    this.activeCount = this.rows.length;
     this.bump();
   }
 
@@ -152,124 +112,21 @@ class SyncStore {
     }
   }
 
-  upsertProgress(p: FileProgressEvent) {
-    const key = p.path;
-    let row = this.rowMap.get(key);
-    if (row) {
-      const previousStatus = row.status;
-      const nextStatus = p.done >= p.total ? "done" : "active";
-      row.done = p.done;
-      row.total = p.total;
-      row.speed = p.speed;
-      row.status = nextStatus;
-      if (previousStatus === "active" && nextStatus !== "active") {
-        this.activeCount = Math.max(0, this.activeCount - 1);
-      } else if (previousStatus !== "active" && nextStatus === "active") {
-        this.activeCount++;
-      }
-      if (previousStatus === "done" && nextStatus !== "done") {
-        this.doneCount = Math.max(0, this.doneCount - 1);
-      } else if (previousStatus !== "done" && nextStatus === "done") {
-        this.doneCount++;
-      }
+  /** Track only a bounded window of failed/retrying files. */
+  upsertRetry(event: RetryEvent) {
+    if (event.state !== "retrying") {
+      this.retries.delete(event.path);
     } else {
-      if (this.rows.length >= MAX_ROWS) {
-        const evicted = this.rows.shift();
-        if (evicted) {
-          this.rowMap.delete(evicted.key);
-          if (evicted.status === "active") this.activeCount = Math.max(0, this.activeCount - 1);
-          else this.doneCount = Math.max(0, this.doneCount - 1);
-        }
+      if (!this.retries.has(event.path) && this.retries.size >= MAX_RETRY_ITEMS) {
+        const oldest = this.retries.keys().next().value;
+        if (oldest) this.retries.delete(oldest);
       }
-      row = {
-        key,
-        path: p.path,
-        done: p.done,
-        total: p.total,
-        speed: p.speed,
-        status: p.done >= p.total ? "done" : "active",
-      };
-      this.rows.push(row);
-      this.rowMap.set(key, row);
-      if (row.status === "active") this.activeCount++;
-      else this.doneCount++;
-    }
-    this.bump();
-  }
-
-  addFilesDone(files: { path: string; size: number }[]) {
-    this.tree.addFiles(files);
-    for (const f of files) {
-      this.retries.delete(f.path); // a retried file that succeeded leaves the queue
-      const row = this.rowMap.get(f.path);
-      if (row) {
-        if (row.status === "active") {
-          this.activeCount = Math.max(0, this.activeCount - 1);
-          this.doneCount++;
-        }
-        row.status = "done";
-        row.done = row.total || f.size;
-      }
-    }
-    this.bump();
-  }
-
-  /** Track files that failed and are queued for retry. */
-  upsertRetry(e: RetryEvent) {
-    if (e.state === "failed") {
-      this.retries.delete(e.path);
-      let row = this.rowMap.get(e.path);
-      if (!row) {
-        if (this.rows.length >= MAX_ROWS) {
-          const evicted = this.rows.shift();
-          if (evicted) {
-            this.rowMap.delete(evicted.key);
-            if (evicted.status === "active") this.activeCount = Math.max(0, this.activeCount - 1);
-            else if (evicted.status === "done") this.doneCount = Math.max(0, this.doneCount - 1);
-          }
-        }
-        row = { key: e.path, path: e.path, done: 0, total: 0, speed: 0, status: "error" };
-        this.rows.push(row);
-        this.rowMap.set(e.path, row);
-      } else if (row.status !== "done" && row.status !== "deleted") {
-        if (row.status === "active") {
-          this.activeCount = Math.max(0, this.activeCount - 1);
-        }
-        row.status = "error";
-        row.speed = 0;
-      }
-    } else {
-      this.retries.set(e.path, {
-        path: e.path,
-        attempt: e.attempt,
-        maxRetries: e.maxRetries,
-        retryAt: Date.now() + e.retryIn * 1000,
+      this.retries.set(event.path, {
+        path: event.path,
+        attempt: event.attempt,
+        maxRetries: event.maxRetries,
+        retryAt: Date.now() + event.retryIn * 1000,
       });
-      const row = this.rowMap.get(e.path);
-      if (row?.status === "active") {
-        this.activeCount = Math.max(0, this.activeCount - 1);
-        row.status = "error";
-        row.speed = 0;
-      }
-    }
-    this.bump();
-  }
-
-  /** Show files/dirs deleted during mirror sync as rows in the transfer list. */
-  addDeleted(paths: string[]) {
-    for (const p of paths) {
-      if (this.rowMap.has(p)) continue;
-      if (this.rows.length >= MAX_ROWS) {
-        const evicted = this.rows.shift();
-        if (evicted) {
-          this.rowMap.delete(evicted.key);
-          if (evicted.status === "active") this.activeCount = Math.max(0, this.activeCount - 1);
-          else this.doneCount = Math.max(0, this.doneCount - 1);
-        }
-      }
-      const row: TransferRow = { key: p, path: p, done: 0, total: 0, speed: 0, status: "deleted" };
-      this.rows.push(row);
-      this.rowMap.set(p, row);
     }
     this.bump();
   }
@@ -285,5 +142,5 @@ class SyncStore {
 
 export const syncStore = new SyncStore();
 
-// ---- Log payloads are also persisted by the backend in UTC-dated files. ----
+// Log payloads are also persisted by the backend in UTC-dated files.
 export type { LogEvent };

@@ -3,7 +3,7 @@
 //! shared bandwidth cap, and emits progress events to the frontend.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
@@ -13,8 +13,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
-use tauri::{AppHandle, Emitter, Runtime};
+use crossbeam_channel::{bounded, RecvTimeoutError};
+use rusqlite::{params, Connection, OptionalExtension};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::client::{list_remote_files, BandwidthLimiter};
 use super::logging;
@@ -30,10 +31,14 @@ const MAX_RETRIES: u32 = MAX_PATH_FAILURES;
 /// Delay between retry attempts.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Max listing retries after the scan connection drops mid-way.
-const MAX_LIST_RETRIES: u32 = 3;
+const MAX_LIST_RETRIES: u32 = 30;
 /// Delay between listing retries.
 const LIST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
+/// UI receives one bounded active-transfer snapshot at this interval.
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+/// Number of entries committed to a temporary SQLite manifest at once.
+const MANIFEST_BATCH_SIZE: usize = 8192;
 pub struct JobProgress {
     pub total_files: u64,
     pub done_files: u64,
@@ -79,6 +84,8 @@ pub struct JobSummary {
     pub error: Option<String>,
     pub message: Option<String>,
 }
+
+type ActiveTransfers = Arc<Mutex<HashMap<String, ActiveFileProgress>>>;
 
 struct SyncTask {
     path: String,
@@ -153,22 +160,237 @@ impl RetryQueue {
     }
 }
 
-/// Hash a relative path into a u64. Used by the mirror-deletion set so it
-/// stores ~16 bytes per file instead of a full string (saves ~10x memory for
-/// hundreds of millions of files). A collision only makes the code *keep* a
-/// local file that would otherwise be deleted, which is the safe direction.
+/// Hash a relative path into a u64 before writing it to the disk manifest.
+/// A collision only makes the code keep a local file that would otherwise be
+/// deleted, which is the safe direction.
 fn path_hash(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
 }
 
-/// A bounded FIFO set of recently-enqueued paths, used only to deduplicate
-/// listing retries. The only paths that could be re-enqueued after a scan
-/// drops are those still waiting in the task queue or being downloaded — a
-/// bounded window of `thread_count * 16 + thread_count`. Older paths (already
-/// processed) are handled by the incremental local-file check on a rescan, so
-/// memory stays tiny even for hundreds of millions of files.
+/// Disk-backed set used by mirror deletion. Only a small insertion buffer and
+/// SQLite page cache stay in memory, regardless of the number of remote paths.
+struct MirrorManifest {
+    path: PathBuf,
+    conn: Option<Connection>,
+    pending: Vec<i64>,
+}
+
+impl MirrorManifest {
+    fn create<R: Runtime>(app: &AppHandle<R>, job_id: &str) -> Result<Self, String> {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("获取应用数据目录失败: {e}"))?
+            .join("sync-manifests");
+        fs::create_dir_all(&dir).map_err(|e| format!("创建镜像清单目录失败: {e}"))?;
+        Self::create_at(dir.join(format!("mirror-{job_id}.sqlite")))
+    }
+
+    fn create_at(path: PathBuf) -> Result<Self, String> {
+        let _ = fs::remove_file(&path);
+        let conn = Connection::open(&path).map_err(|e| format!("创建镜像清单失败: {e}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=OFF;
+             PRAGMA synchronous=OFF;
+             PRAGMA locking_mode=EXCLUSIVE;
+             PRAGMA cache_size=-16384;
+             PRAGMA temp_store=FILE;
+             CREATE TABLE seen (
+               hash INTEGER PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )
+        .map_err(|e| format!("初始化镜像清单失败: {e}"))?;
+        Ok(Self {
+            path,
+            conn: Some(conn),
+            pending: Vec::with_capacity(MANIFEST_BATCH_SIZE),
+        })
+    }
+
+    fn insert_path(&mut self, path: &str) -> Result<(), String> {
+        self.pending.push(path_hash(path) as i64);
+        if self.pending.len() >= MANIFEST_BATCH_SIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut hashes = std::mem::take(&mut self.pending);
+        hashes.sort_unstable();
+        hashes.dedup();
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| "镜像清单连接已关闭".to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("开始写入镜像清单失败: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT OR IGNORE INTO seen(hash) VALUES (?1)")
+                .map_err(|e| format!("准备镜像清单写入失败: {e}"))?;
+            for hash in hashes {
+                stmt.execute(params![hash])
+                    .map_err(|e| format!("写入镜像清单失败: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("提交镜像清单失败: {e}"))
+    }
+
+    fn contains_hash(&self, hash: u64) -> bool {
+        let Some(conn) = self.conn.as_ref() else {
+            return true;
+        };
+        // Query failures keep the local path, which is the safe direction for
+        // mirror deletion.
+        match conn
+            .query_row(
+                "SELECT 1 FROM seen WHERE hash = ?1",
+                params![hash as i64],
+                |_| Ok(1u8),
+            )
+            .optional()
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+}
+
+impl Drop for MirrorManifest {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.close();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Exact, disk-backed set of file paths already processed by the listing
+/// callback. Unlike the mirror manifest, this must store the full path: a hash
+/// collision here could otherwise suppress a real transfer.
+struct ScanManifest {
+    path: PathBuf,
+    conn: Option<Connection>,
+    pending: Vec<String>,
+}
+
+impl ScanManifest {
+    fn create<R: Runtime>(app: &AppHandle<R>, job_id: &str) -> Result<Self, String> {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("获取应用数据目录失败: {e}"))?
+            .join("sync-manifests");
+        fs::create_dir_all(&dir).map_err(|e| format!("创建扫描去重目录失败: {e}"))?;
+        Self::create_at(dir.join(format!("scan-{job_id}.sqlite")))
+    }
+
+    fn create_at(path: PathBuf) -> Result<Self, String> {
+        let _ = fs::remove_file(&path);
+        let conn = Connection::open(&path).map_err(|e| format!("创建扫描去重数据库失败: {e}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=OFF;
+             PRAGMA synchronous=OFF;
+             PRAGMA locking_mode=EXCLUSIVE;
+             PRAGMA cache_size=-32768;
+             PRAGMA temp_store=FILE;
+             CREATE TABLE scanned (
+               path TEXT PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )
+        .map_err(|e| format!("初始化扫描去重数据库失败: {e}"))?;
+        Ok(Self {
+            path,
+            conn: Some(conn),
+            pending: Vec::with_capacity(MANIFEST_BATCH_SIZE),
+        })
+    }
+
+    fn insert_path(&mut self, path: &str) -> Result<(), String> {
+        self.pending.push(path.to_owned());
+        if self.pending.len() >= MANIFEST_BATCH_SIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let paths = std::mem::take(&mut self.pending);
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| "扫描去重数据库连接已关闭".to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("开始写入扫描去重数据库失败: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT OR IGNORE INTO scanned(path) VALUES (?1)")
+                .map_err(|e| format!("准备扫描去重写入失败: {e}"))?;
+            for path in paths {
+                stmt.execute(params![path])
+                    .map_err(|e| format!("写入扫描去重数据库失败: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("提交扫描去重数据库失败: {e}"))
+    }
+
+    fn contains_path(&self, path: &str) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| "扫描去重数据库连接已关闭".to_string())?;
+        conn.query_row(
+            "SELECT 1 FROM scanned WHERE path = ?1",
+            params![path],
+            |_| Ok(1u8),
+        )
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(|e| format!("查询扫描去重数据库失败: {e}"))
+    }
+}
+
+impl Drop for ScanManifest {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.close();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+trait PathPresence {
+    fn contains_path_hash(&self, hash: u64) -> bool;
+}
+
+impl PathPresence for MirrorManifest {
+    fn contains_path_hash(&self, hash: u64) -> bool {
+        self.contains_hash(hash)
+    }
+}
+
+#[cfg(test)]
+impl PathPresence for HashSet<u64> {
+    fn contains_path_hash(&self, hash: u64) -> bool {
+        self.contains(&hash)
+    }
+}
+
+/// A bounded FIFO set used to suppress an unexpected duplicate emitted within
+/// the current listing pass. Cross-pass retry history lives in ScanManifest.
 struct BoundedPathSet {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -244,31 +466,88 @@ pub fn run_job<R: Runtime>(
         format!("开始同步：{} → {}", opts.share, opts.local_dir),
     );
 
-    // Relative paths present on the remote, collected during the scan. Only
-    // used when mirror-deletion is enabled, to remove local leftovers. Stored
-    // as u64 hashes to keep memory bounded for huge file counts.
-    let seen: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Mirror deletion uses a temporary disk-backed manifest. A failed manifest
+    // disables deletion for this run rather than falling back to unbounded RAM.
+    let (mirror_manifest, initial_manifest_error) = if opts.delete_removed {
+        match MirrorManifest::create(app, job_id) {
+            Ok(manifest) => (Some(manifest), None),
+            Err(error) => {
+                log_warn(
+                    app,
+                    job_id,
+                    format!("无法创建磁盘镜像清单，本次将禁用镜像删除：{error}"),
+                );
+                (None, Some(error))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    // Optional exact-path manifest for safe full rescans after a partial
+    // listing failure. If it cannot be created, the initial scan may continue,
+    // but partial retries remain disabled because they would duplicate work.
+    let (scan_manifest, initial_scan_manifest_error) = if opts.rescan_on_interrupt {
+        match ScanManifest::create(app, job_id) {
+            Ok(manifest) => {
+                log_info(
+                    app,
+                    job_id,
+                    "已启用扫描中断自动重扫：已扫描路径将写入本机磁盘数据库",
+                );
+                (Some(manifest), None)
+            }
+            Err(error) => {
+                log_warn(
+                    app,
+                    job_id,
+                    format!("无法创建扫描去重数据库，部分扫描后的自动重扫已禁用：{error}"),
+                );
+                (None, Some(error))
+            }
+        }
+    } else {
+        (None, None)
+    };
     // Non-zero means the server completed a partial scan after giving up on
     // inaccessible paths. This is also a safety gate for mirror deletion.
     let remote_skipped_paths = Arc::new(AtomicU64::new(0));
 
     let thread_count = opts.threads.max(1).min(512);
     let (task_tx, task_rx) = bounded::<SyncTask>(thread_count * 16);
-    let (done_tx, done_rx) = bounded::<FileDone>(8192);
+    let active_transfers: ActiveTransfers = Arc::new(Mutex::new(HashMap::with_capacity(
+        thread_count.saturating_mul(2),
+    )));
+    // Monotonic count of bytes actually written by all workers, including
+    // partial large files and retry attempts. Used only for live throughput.
+    let transferred_bytes = Arc::new(AtomicU64::new(0));
+    let emitter_done = Arc::new(AtomicBool::new(false));
 
-    // Emitter thread: batches completed-file events and emits periodic job stats.
+    // Emitter thread: sends only bounded active snapshots and aggregate stats.
     let emitter = {
         let app = app.clone();
         let job_id = job_id.to_string();
         let progress = Arc::clone(&progress);
+        let active_transfers = Arc::clone(&active_transfers);
+        let transferred_bytes = Arc::clone(&transferred_bytes);
         let stop = Arc::clone(&stop);
-        thread::spawn(move || emitter_loop(&app, &job_id, done_rx, progress, stop))
+        let emitter_done = Arc::clone(&emitter_done);
+        thread::spawn(move || {
+            emitter_loop(
+                &app,
+                &job_id,
+                progress,
+                active_transfers,
+                transferred_bytes,
+                stop,
+                emitter_done,
+            )
+        })
     };
 
     // Listing thread: streams the remote file tree into the task queue. If the
     // connection drops mid-scan (e.g. os error 10054), the scan is retried a
-    // few times instead of failing the whole job; paths already queued are
-    // remembered so a retry does not enqueue duplicates.
+    // few times when enabled instead of failing the whole job; an exact
+    // disk-backed manifest prevents duplicate stats and transfer tasks.
     let listing = {
         let task_tx = task_tx.clone();
         let stop = Arc::clone(&stop);
@@ -276,7 +555,10 @@ pub fn run_job<R: Runtime>(
         let app = app.clone();
         let job_id = job_id.to_string();
         let l_opts = opts.clone();
-        let seen = Arc::clone(&seen);
+        let mut mirror_manifest = mirror_manifest;
+        let mut manifest_error = initial_manifest_error;
+        let mut scan_manifest = scan_manifest;
+        let mut scan_manifest_error = initial_scan_manifest_error;
         let remote_skipped_paths = Arc::clone(&remote_skipped_paths);
         // Bounded to the in-pipeline window (queue + in-flight workers) so it
         // stays tiny regardless of how many files are scanned.
@@ -288,6 +570,8 @@ pub fn run_job<R: Runtime>(
             let mut ok = false;
             for attempt in 0..=MAX_LIST_RETRIES {
                 let mut attempt_files = 0u64;
+                let mut attempt_new_files = 0u64;
+                let mut callback_error: Option<String> = None;
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -306,7 +590,7 @@ pub fn run_job<R: Runtime>(
                         &app,
                         &job_id,
                         format!(
-                            "扫描远端目录连接中断，{} 秒后进行第 {}/{} 次重试",
+                            "扫描远端目录连接中断，{} 秒后进行第 {}/{} 次重扫；已扫描路径将从磁盘数据库去重",
                             LIST_RETRY_INTERVAL.as_secs(),
                             attempt,
                             MAX_LIST_RETRIES
@@ -317,13 +601,19 @@ pub fn run_job<R: Runtime>(
                         break;
                     }
                 }
-                let res = list_remote_files(
+                let list_result = list_remote_files(
                     &l_opts.remote_ip,
                     l_opts.remote_port,
                     &l_opts.share,
                     |entry| {
-                        if l_opts.delete_removed {
-                            seen.lock().unwrap().insert(path_hash(&entry.path));
+                        if manifest_error.is_none() {
+                            let insert_error = mirror_manifest
+                                .as_mut()
+                                .and_then(|manifest| manifest.insert_path(&entry.path).err());
+                            if let Some(error) = insert_error {
+                                manifest_error = Some(error);
+                                mirror_manifest = None;
+                            }
                         }
                         if stop.load(Ordering::Relaxed) {
                             return false;
@@ -332,25 +622,45 @@ pub fn run_job<R: Runtime>(
                             return true;
                         }
                         attempt_files += 1;
-                        {
+                        if attempt > 0 {
+                            if let Some(manifest) = scan_manifest.as_ref() {
+                                match manifest.contains_path(&entry.path) {
+                                    Ok(true) => return true,
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        callback_error = Some(error);
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                        if sent_paths.lock().unwrap().contains(&entry.path) {
+                            return true;
+                        }
+                        if let Some(manifest) = scan_manifest.as_mut() {
+                            if let Err(error) = manifest.insert_path(&entry.path) {
+                                callback_error = Some(error);
+                                return false;
+                            }
+                        }
+                        attempt_new_files += 1;
+                        let unique_scanned = {
                             let mut p = progress.lock().unwrap();
                             p.scanned_files += 1;
                             if p.scanned_files % 2048 == 0 && p.active_files == 0 {
                                 p.activity = format!("正在扫描：{}", entry.path);
                             }
-                        }
-                        if attempt_files % 100_000 == 0 {
+                            p.scanned_files
+                        };
+                        if unique_scanned % 100_000 == 0 {
                             log_info(
                                 &app,
                                 &job_id,
                                 format!(
-                                    "远端目录已扫描 {} 个文件，当前：{}",
-                                    attempt_files, entry.path
+                                    "远端目录已扫描 {} 个不重复文件，当前：{}",
+                                    unique_scanned, entry.path
                                 ),
                             );
-                        }
-                        if sent_paths.lock().unwrap().contains(&entry.path) {
-                            return true;
                         }
                         if l_opts.incremental {
                             // Skip if the local copy is already up to date.
@@ -380,12 +690,35 @@ pub fn run_job<R: Runtime>(
                             })
                             .is_err()
                         {
+                            if !stop.load(Ordering::Relaxed) {
+                                callback_error = Some("同步传输队列已关闭".into());
+                            }
                             return false;
                         }
                         sent_paths.lock().unwrap().insert(entry.path.clone());
                         true
                     },
                 );
+                let mut local_failure = callback_error.is_some();
+                let mut res = match callback_error.take() {
+                    Some(error) => Err(error),
+                    None => list_result,
+                };
+                // A network error can occur after the last in-memory SQLite
+                // batch. Commit it before reconnecting so every processed path
+                // is visible to the next full rescan.
+                if res.is_err() && !local_failure && attempt_new_files > 0 {
+                    if let Some(manifest) = scan_manifest.as_mut() {
+                        if let Err(error) = manifest.flush() {
+                            local_failure = true;
+                            scan_manifest_error = Some(error.clone());
+                            res = Err(error);
+                        }
+                    }
+                }
+                if scan_manifest_error.is_some() {
+                    scan_manifest = None;
+                }
                 match res {
                     Ok((remote_files, remote_bytes, skipped_paths)) => {
                         ok = true;
@@ -430,9 +763,32 @@ pub fn run_job<R: Runtime>(
                                 last_err.as_deref().unwrap_or_default()
                             ),
                         );
-                        if attempt_files > 0 {
+                        if local_failure {
                             let message = format!(
-                                "远端目录扫描在已处理 {attempt_files} 个文件后中断。为避免从头重扫造成重复统计和数小时假卡死，已结束本次任务：{}",
+                                "远端目录扫描因本机处理失败而中断，无法安全重扫：{}",
+                                last_err.as_deref().unwrap_or_default()
+                            );
+                            let mut p = progress.lock().unwrap();
+                            p.phase = "error".into();
+                            p.activity = "本机扫描去重或传输队列异常".into();
+                            if p.error.is_none() {
+                                p.error = Some(message.clone());
+                            }
+                            drop(p);
+                            log_error(&app, &job_id, message);
+                            break;
+                        }
+                        let can_rescan_partial = l_opts.rescan_on_interrupt
+                            && scan_manifest.is_some()
+                            && scan_manifest_error.is_none();
+                        if attempt_files > 0 && !can_rescan_partial {
+                            let retry_reason = if l_opts.rescan_on_interrupt {
+                                "扫描去重数据库不可用"
+                            } else {
+                                "未启用“扫描中断后自动重新扫描”"
+                            };
+                            let message = format!(
+                                "远端目录扫描在本轮读取 {attempt_files} 个文件后中断（{retry_reason}）。为避免重复统计和重复传输，已结束本次任务：{}",
                                 last_err.as_deref().unwrap_or_default()
                             );
                             let mut p = progress.lock().unwrap();
@@ -444,6 +800,15 @@ pub fn run_job<R: Runtime>(
                             drop(p);
                             log_error(&app, &job_id, message);
                             break;
+                        }
+                        if attempt_files > 0 && attempt < MAX_LIST_RETRIES {
+                            log_warn(
+                                &app,
+                                &job_id,
+                                format!(
+                                    "本轮扫描中断：读取 {attempt_files} 个文件，其中新增 {attempt_new_files} 个；即将从根目录重扫并使用磁盘数据库去重"
+                                ),
+                            );
                         }
                     }
                 }
@@ -460,6 +825,16 @@ pub fn run_job<R: Runtime>(
                     p.activity = "无法连接远端目录扫描服务".into();
                 }
             }
+            if manifest_error.is_none() {
+                let flush_error = mirror_manifest
+                    .as_mut()
+                    .and_then(|manifest| manifest.flush().err());
+                if let Some(error) = flush_error {
+                    manifest_error = Some(error);
+                    mirror_manifest = None;
+                }
+            }
+            (mirror_manifest, manifest_error)
         })
     };
     drop(task_tx);
@@ -478,8 +853,9 @@ pub fn run_job<R: Runtime>(
         let rx = task_rx.clone();
         let stop = Arc::clone(&stop);
         let progress = Arc::clone(&progress);
+        let active_transfers = Arc::clone(&active_transfers);
+        let transferred_bytes = Arc::clone(&transferred_bytes);
         let limiter = Arc::clone(&limiter);
-        let done_tx = done_tx.clone();
         let retry_queue = Arc::clone(&retry_queue);
         let w_opts = opts.clone();
         let app = app.clone();
@@ -495,9 +871,16 @@ pub fn run_job<R: Runtime>(
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             };
-            transfer_started(&app, &job_id, &progress, &task);
-            let result = download_file(&app, &job_id, &w_opts, &limiter, &stop, &task, &done_tx);
-            transfer_finished(&progress);
+            transfer_started(&progress, &active_transfers, &task);
+            let result = download_file(
+                &w_opts,
+                &limiter,
+                &stop,
+                &task,
+                &active_transfers,
+                &transferred_bytes,
+            );
+            transfer_finished(&progress, &active_transfers, &task.path);
             match result {
                 Ok(()) => {
                     let mut p = progress.lock().unwrap();
@@ -552,13 +935,20 @@ pub fn run_job<R: Runtime>(
             &limiter,
             &stop,
             &progress,
-            &done_tx,
+            &active_transfers,
+            &transferred_bytes,
             &retry_queue,
             &main_done,
         ));
     }
 
-    let _ = listing.join();
+    let (mirror_manifest, manifest_error) = match listing.join() {
+        Ok(result) => result,
+        Err(_) => (
+            None,
+            Some("目录扫描线程异常退出，镜像清单不可用".to_string()),
+        ),
+    };
     for w in workers {
         let _ = w.join();
     }
@@ -588,7 +978,8 @@ pub fn run_job<R: Runtime>(
             &limiter,
             &stop,
             &progress,
-            &done_tx,
+            &active_transfers,
+            &transferred_bytes,
             &retry_queue,
             &main_done,
         ));
@@ -605,7 +996,7 @@ pub fn run_job<R: Runtime>(
             p.activity = "正在写入最终统计并检查镜像删除".into();
         }
     }
-    drop(done_tx);
+    emitter_done.store(true, Ordering::Relaxed);
     let _ = emitter.join();
 
     // Mirror-deletion: remove local files/dirs that no longer exist on the remote.
@@ -620,36 +1011,30 @@ pub fn run_job<R: Runtime>(
                     "服务端跳过了 {skipped_paths} 个无法访问路径，本次已禁用镜像删除以防误删本地文件"
                 ),
             );
+        } else if let Some(error) = manifest_error.as_deref() {
+            log_warn(
+                app,
+                job_id,
+                format!("磁盘镜像清单不可用，本次已禁用镜像删除以防误删：{error}"),
+            );
         } else if !has_error {
-            let payload = {
-                let mut p = progress.lock().unwrap();
-                p.phase = "deleting".into();
-                p.activity = "正在删除远端已不存在的本地文件".into();
-                job_payload(job_id, JobStatus::Running, &p, None)
-            };
-            let _ = app.emit(EVT_JOB, payload);
-            log_info(app, job_id, "开始检查并删除远端已不存在的本地文件");
-            let mut deleted_paths: Vec<String> = Vec::new();
-            let (del_files, del_dirs) = {
-                let seen = seen.lock().unwrap();
-                delete_missing(&local_root, &seen, &mut deleted_paths)
-            };
-            // Stream deletion events to the frontend in chunks.
-            for chunk in deleted_paths.chunks(2000) {
-                let _ = app.emit(
-                    EVT_FILES_DELETED,
-                    FilesDeletedPayload {
-                        id: job_id.to_string(),
-                        files: chunk.to_vec(),
-                    },
-                );
-            }
-            if del_files > 0 || del_dirs > 0 {
-                log_info(
-                    app,
-                    job_id,
-                    format!("镜像删除完成：删除 {del_files} 个文件、{del_dirs} 个目录"),
-                );
+            if let Some(manifest) = mirror_manifest.as_ref() {
+                let payload = {
+                    let mut p = progress.lock().unwrap();
+                    p.phase = "deleting".into();
+                    p.activity = "正在删除远端已不存在的本地文件".into();
+                    job_payload(job_id, JobStatus::Running, &p, None)
+                };
+                let _ = app.emit(EVT_JOB, payload);
+                log_info(app, job_id, "开始按磁盘镜像清单检查本地残留文件");
+                let (del_files, del_dirs) = delete_missing(&local_root, manifest);
+                if del_files > 0 || del_dirs > 0 {
+                    log_info(
+                        app,
+                        job_id,
+                        format!("镜像删除完成：删除 {del_files} 个文件、{del_dirs} 个目录"),
+                    );
+                }
             }
         }
     }
@@ -731,7 +1116,8 @@ fn spawn_retry_worker<R: Runtime>(
     limiter: &Arc<BandwidthLimiter>,
     stop: &Arc<AtomicBool>,
     progress: &Arc<Mutex<JobProgress>>,
-    done_tx: &Sender<FileDone>,
+    active_transfers: &ActiveTransfers,
+    transferred_bytes: &Arc<AtomicU64>,
     queue: &Arc<RetryQueue>,
     main_done: &Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -741,7 +1127,8 @@ fn spawn_retry_worker<R: Runtime>(
     let limiter = Arc::clone(limiter);
     let stop = Arc::clone(stop);
     let progress = Arc::clone(progress);
-    let done_tx = done_tx.clone();
+    let active_transfers = Arc::clone(active_transfers);
+    let transferred_bytes = Arc::clone(transferred_bytes);
     let queue = Arc::clone(queue);
     let main_done = Arc::clone(main_done);
     thread::spawn(move || {
@@ -765,14 +1152,34 @@ fn spawn_retry_worker<R: Runtime>(
                 path: task.path.clone(),
                 size: task.size,
             };
-            transfer_started(&app, &job_id, &progress, &sync_task);
-            let result = download_file(&app, &job_id, &opts, &limiter, &stop, &sync_task, &done_tx);
-            transfer_finished(&progress);
+            transfer_started(&progress, &active_transfers, &sync_task);
+            let result = download_file(
+                &opts,
+                &limiter,
+                &stop,
+                &sync_task,
+                &active_transfers,
+                &transferred_bytes,
+            );
+            transfer_finished(&progress, &active_transfers, &sync_task.path);
             match result {
                 Ok(()) => {
-                    let mut p = progress.lock().unwrap();
-                    p.done_files += 1;
-                    p.done_bytes += task.size;
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.done_files += 1;
+                        p.done_bytes += task.size;
+                    }
+                    let _ = app.emit(
+                        EVT_RETRY,
+                        RetryPayload {
+                            id: job_id.clone(),
+                            path: task.path.clone(),
+                            attempt,
+                            max_retries: MAX_RETRIES,
+                            retry_in: 0,
+                            state: "succeeded".into(),
+                        },
+                    );
                 }
                 Err(e) => {
                     if stop.load(Ordering::Relaxed) {
@@ -839,12 +1246,11 @@ fn spawn_retry_worker<R: Runtime>(
 }
 
 /// Recursively delete local entries whose relative path is not present on the
-/// remote share (used for mirror sync). Deleted paths are pushed to `deleted`.
-/// Returns (deleted_files, deleted_dirs).
-fn delete_missing(root: &Path, seen: &HashSet<u64>, deleted: &mut Vec<String>) -> (u64, u64) {
+/// remote share. Only aggregate counts are retained, so deletion is bounded.
+fn delete_missing<P: PathPresence>(root: &Path, seen: &P) -> (u64, u64) {
     let mut files = 0u64;
     let mut dirs = 0u64;
-    visit_delete(root, root, seen, &mut files, &mut dirs, deleted);
+    visit_delete(root, root, seen, &mut files, &mut dirs);
     (files, dirs)
 }
 
@@ -854,20 +1260,18 @@ fn rel_of(root: &Path, p: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn visit_delete(
+fn visit_delete<P: PathPresence>(
     root: &Path,
     dir: &Path,
-    seen: &HashSet<u64>,
+    seen: &P,
     files: &mut u64,
     dirs: &mut u64,
-    deleted: &mut Vec<String>,
 ) {
     let rel = rel_of(root, dir);
-    if !rel.is_empty() && !seen.contains(&path_hash(&rel)) {
+    if !rel.is_empty() && !seen.contains_path_hash(path_hash(&rel)) {
         // The whole subtree no longer exists on the remote side.
         if fs::remove_dir_all(dir).is_ok() {
             *dirs += 1;
-            deleted.push(rel);
         }
         return;
     }
@@ -882,26 +1286,22 @@ fn visit_delete(
         };
         let rrel = rel_of(root, &e.path());
         if md.is_dir() {
-            visit_delete(root, &e.path(), seen, files, dirs, deleted);
-        } else if !seen.contains(&path_hash(&rrel)) {
-            if fs::remove_file(&e.path()).is_ok() {
-                *files += 1;
-                deleted.push(rrel);
-            }
+            visit_delete(root, &e.path(), seen, files, dirs);
+        } else if !seen.contains_path_hash(path_hash(&rrel)) && fs::remove_file(e.path()).is_ok() {
+            *files += 1;
         }
     }
 }
 
-/// Download a single file over its own TCP connection.
-#[allow(clippy::too_many_arguments)]
-fn download_file<R: Runtime>(
-    app: &AppHandle<R>,
-    job_id: &str,
+/// Download a single file over its own TCP connection. Progress is written
+/// into a bounded active map; only the emitter thread crosses the WebView IPC.
+fn download_file(
     opts: &SyncOptions,
     limiter: &BandwidthLimiter,
     stop: &AtomicBool,
     task: &SyncTask,
-    done_tx: &Sender<FileDone>,
+    active_transfers: &ActiveTransfers,
+    transferred_bytes: &AtomicU64,
 ) -> Result<(), String> {
     let mut stream = connect_with_timeout(&opts.remote_ip, opts.remote_port, 15)?;
     stream
@@ -986,124 +1386,92 @@ fn download_file<R: Runtime>(
         }
         remaining -= n as u64;
         file_done += n as u64;
+        transferred_bytes.fetch_add(n as u64, Ordering::Relaxed);
 
-        // Throttle progress events: emit on each >=1% change (at most ~100
-        // events per file) plus a 2s heartbeat so very slow large files still
-        // show live speed. Previously every worker emitted every 200ms, which
-        // flooded the frontend at high thread counts.
+        // Updating this in-memory entry is cheap and bounded by worker count.
+        // The emitter snapshots the entire map at a fixed low frequency.
         let pct = file_done.saturating_mul(100) / size;
         let elapsed = last_emit.elapsed();
         if (pct > last_pct && elapsed >= Duration::from_millis(200))
             || elapsed >= Duration::from_secs(2)
         {
             let speed = (file_done as f64 / file_start.elapsed().as_secs_f64().max(0.001)) as u64;
-            let _ = app.emit(
-                EVT_PROGRESS,
-                FileProgressPayload {
-                    id: job_id.to_string(),
-                    path: task.path.clone(),
-                    done: file_done,
-                    total: size,
-                    speed,
-                },
-            );
+            if let Some(item) = active_transfers.lock().unwrap().get_mut(&task.path) {
+                item.done = file_done;
+                item.total = size;
+                item.speed = speed;
+            }
             last_pct = pct;
             last_emit = Instant::now();
         }
     }
 
-    let _ = app.emit(
-        EVT_PROGRESS,
-        FileProgressPayload {
-            id: job_id.to_string(),
-            path: task.path.clone(),
-            done: size,
-            total: size,
-            speed: 0,
-        },
-    );
-    let _ = done_tx.send(FileDone {
-        path: task.path.clone(),
-        size: task.size,
-    });
     Ok(())
 }
 
 fn emitter_loop<R: Runtime>(
     app: &AppHandle<R>,
     job_id: &str,
-    done_rx: Receiver<FileDone>,
     progress: Arc<Mutex<JobProgress>>,
+    active_transfers: ActiveTransfers,
+    transferred_bytes: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
 ) {
-    let mut buf: Vec<FileDone> = Vec::new();
-    let mut last_files_emit = Instant::now();
-    let mut last_job_emit = Instant::now();
+    let mut last_emit = Instant::now();
     let mut speed_time = Instant::now();
-    let mut speed_bytes: u64 = 0;
+    let mut last_transferred_bytes: u64 = 0;
 
     loop {
-        // A stop request must surface in the UI immediately. Report the
-        // terminal state ourselves instead of waiting for the channel to
-        // disconnect, which can lag behind when other threads are slow to
-        // unwind (otherwise the UI would keep seeing "running" events).
-        if stop.load(Ordering::Relaxed) {
-            flush_files(app, job_id, &mut buf);
-            let p = progress.lock().unwrap();
-            let payload = job_payload(job_id, JobStatus::Stopped, &p, None);
-            drop(p);
-            let _ = app.emit(EVT_JOB, payload);
-            break;
-        }
-        let recv = match done_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(f) => Some(f),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => {
-                flush_files(app, job_id, &mut buf);
-                break;
-            }
-        };
-        if let Some(f) = recv {
-            buf.push(f);
-        }
-        if (last_files_emit.elapsed() >= Duration::from_millis(100) && !buf.is_empty())
-            || buf.len() >= 1000
-        {
-            flush_files(app, job_id, &mut buf);
-            last_files_emit = Instant::now();
-        }
-        if last_job_emit.elapsed() >= Duration::from_millis(250) {
+        let stopped = stop.load(Ordering::Relaxed);
+        let finished = done.load(Ordering::Relaxed);
+        if stopped || finished || last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+            let mut files: Vec<_> = if stopped {
+                Vec::new()
+            } else {
+                active_transfers.lock().unwrap().values().cloned().collect()
+            };
+            files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+            let _ = app.emit(
+                EVT_PROGRESS,
+                FileProgressPayload {
+                    id: job_id.to_string(),
+                    files,
+                },
+            );
+
             let mut p = progress.lock().unwrap();
             let dt = speed_time.elapsed().as_secs_f64().max(0.001);
-            p.speed = ((p.done_bytes - speed_bytes) as f64 / dt) as u64;
+            let current_transferred_bytes = transferred_bytes.load(Ordering::Relaxed);
+            p.speed = if stopped || finished {
+                0
+            } else {
+                (current_transferred_bytes.saturating_sub(last_transferred_bytes) as f64 / dt)
+                    as u64
+            };
             speed_time = Instant::now();
-            speed_bytes = p.done_bytes;
-            let payload = job_payload(job_id, JobStatus::Running, &p, None);
+            last_transferred_bytes = current_transferred_bytes;
+            let status = if stopped {
+                JobStatus::Stopped
+            } else {
+                JobStatus::Running
+            };
+            let payload = job_payload(job_id, status, &p, None);
             drop(p);
             let _ = app.emit(EVT_JOB, payload);
-            last_job_emit = Instant::now();
+            last_emit = Instant::now();
+
+            if stopped || finished {
+                break;
+            }
         }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn flush_files<R: Runtime>(app: &AppHandle<R>, job_id: &str, buf: &mut Vec<FileDone>) {
-    if buf.is_empty() {
-        return;
-    }
-    let files = std::mem::take(buf);
-    let _ = app.emit(
-        EVT_FILES_DONE,
-        FilesDonePayload {
-            id: job_id.to_string(),
-            files,
-        },
-    );
-}
-
-fn transfer_started<R: Runtime>(
-    app: &AppHandle<R>,
-    job_id: &str,
+fn transfer_started(
     progress: &Arc<Mutex<JobProgress>>,
+    active_transfers: &ActiveTransfers,
     task: &SyncTask,
 ) {
     {
@@ -1115,12 +1483,9 @@ fn transfer_started<R: Runtime>(
         }
         p.activity = format!("正在传输：{}", task.path);
     }
-    // Emit immediately, before connecting or reading the first data block, so
-    // every in-flight file has a visible row in the client UI from 0% onward.
-    let _ = app.emit(
-        EVT_PROGRESS,
-        FileProgressPayload {
-            id: job_id.to_string(),
+    active_transfers.lock().unwrap().insert(
+        task.path.clone(),
+        ActiveFileProgress {
             path: task.path.clone(),
             done: 0,
             total: task.size,
@@ -1129,7 +1494,12 @@ fn transfer_started<R: Runtime>(
     );
 }
 
-fn transfer_finished(progress: &Arc<Mutex<JobProgress>>) {
+fn transfer_finished(
+    progress: &Arc<Mutex<JobProgress>>,
+    active_transfers: &ActiveTransfers,
+    path: &str,
+) {
+    active_transfers.lock().unwrap().remove(path);
     let mut p = progress.lock().unwrap();
     p.active_files = p.active_files.saturating_sub(1);
     if p.active_files == 0 {
@@ -1191,6 +1561,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mirror_manifest_is_disk_backed_and_cleaned_up() {
+        let path = std::env::temp_dir().join(format!(
+            "bbdduck-mirror-manifest-test-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let mut manifest = MirrorManifest::create_at(path.clone()).unwrap();
+            manifest.insert_path("keep/a.txt").unwrap();
+            manifest.insert_path("keep/a.txt").unwrap();
+            manifest.insert_path("keep/sub/b.txt").unwrap();
+            manifest.flush().unwrap();
+            assert!(manifest.contains_hash(path_hash("keep/a.txt")));
+            assert!(manifest.contains_hash(path_hash("keep/sub/b.txt")));
+            assert!(!manifest.contains_hash(path_hash("missing.txt")));
+        }
+        assert!(
+            !path.exists(),
+            "temporary manifest should be removed on drop"
+        );
+    }
+
+    #[test]
+    fn scan_manifest_tracks_exact_paths_and_is_cleaned_up() {
+        let path = std::env::temp_dir().join(format!(
+            "bbdduck-scan-manifest-test-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let mut manifest = ScanManifest::create_at(path.clone()).unwrap();
+            manifest.insert_path("folder/report.txt").unwrap();
+            manifest.insert_path("folder/report (copy).txt").unwrap();
+            manifest.flush().unwrap();
+
+            assert!(manifest.contains_path("folder/report.txt").unwrap());
+            assert!(manifest.contains_path("folder/report (copy).txt").unwrap());
+            assert!(!manifest.contains_path("folder/REPORT.txt").unwrap());
+            assert!(!manifest.contains_path("folder/missing.txt").unwrap());
+        }
+        assert!(
+            !path.exists(),
+            "temporary scan manifest should be removed on drop"
+        );
+    }
+
+    #[test]
     fn delete_missing_removes_leftovers_keeps_mirrored() {
         let root = std::env::temp_dir().join(format!("bbdduck-del-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1205,14 +1622,10 @@ mod tests {
             .iter()
             .map(|s| path_hash(s))
             .collect();
-        let mut deleted: Vec<String> = Vec::new();
-        let (files, dirs) = delete_missing(&root, &seen, &mut deleted);
+        let (files, dirs) = delete_missing(&root, &seen);
 
         assert_eq!(files, 1, "only stale.txt should be removed");
         assert_eq!(dirs, 1, "only stale_dir should be removed");
-        assert_eq!(deleted.len(), 2);
-        assert!(deleted.contains(&"stale.txt".to_string()));
-        assert!(deleted.contains(&"stale_dir".to_string()));
         assert!(root.join("keep/a.txt").exists());
         assert!(root.join("keep/sub/b.txt").exists());
         assert!(!root.join("stale.txt").exists());

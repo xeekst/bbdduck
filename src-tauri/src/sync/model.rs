@@ -14,6 +14,10 @@ pub struct SyncOptions {
     /// Max total bandwidth in MB/s. 0 = unlimited.
     pub bandwidth_mbps: u64,
     pub incremental: bool,
+    /// Retry a directory listing that was interrupted after partial progress.
+    /// A temporary disk-backed exact-path manifest prevents duplicate stats and transfers.
+    #[serde(default)]
+    pub rescan_on_interrupt: bool,
     /// When enabled, also delete local files/dirs that no longer exist on the remote.
     #[serde(default)]
     pub delete_removed: bool,
@@ -159,8 +163,7 @@ pub struct JobEventPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FileProgressPayload {
-    pub id: String,
+pub struct ActiveFileProgress {
     pub path: String,
     pub done: u64,
     pub total: u64,
@@ -169,24 +172,29 @@ pub struct FileProgressPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FileDone {
+pub struct FileProgressPayload {
+    pub id: String,
+    /// Complete bounded snapshot of files that are active at emit time.
+    pub files: Vec<ActiveFileProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedEntry {
+    pub name: String,
     pub path: String,
+    pub is_dir: bool,
     pub size: u64,
+    pub modified: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FilesDonePayload {
-    pub id: String,
-    pub files: Vec<FileDone>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FilesDeletedPayload {
-    pub id: String,
-    /// Relative paths of deleted files/dirs.
-    pub files: Vec<String>,
+pub struct CompletedPage {
+    pub relative: String,
+    pub offset: usize,
+    pub has_more: bool,
+    pub entries: Vec<CompletedEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,8 +225,6 @@ pub struct LogPayload {
 pub const EVT_SERVER: &str = "sync-server";
 pub const EVT_JOB: &str = "sync-job";
 pub const EVT_PROGRESS: &str = "sync-progress";
-pub const EVT_FILES_DONE: &str = "sync-files-done";
-pub const EVT_FILES_DELETED: &str = "sync-files-deleted";
 pub const EVT_RETRY: &str = "sync-retry";
 pub const EVT_LOG: &str = "sync-log";
 

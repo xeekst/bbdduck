@@ -159,7 +159,8 @@ fn hostname() -> String {
 fn collect_adapters() -> Result<Adapters, String> {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+        IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
@@ -188,7 +189,9 @@ fn collect_adapters() -> Result<Adapters, String> {
         };
     }
     if ret != NO_ERROR {
-        return Err(format!("获取网卡信息失败：GetAdaptersAddresses 错误码 {ret}"));
+        return Err(format!(
+            "获取网卡信息失败：GetAdaptersAddresses 错误码 {ret}"
+        ));
     }
 
     let mut interfaces = Vec::new();
@@ -283,7 +286,9 @@ unsafe fn pwstr(p: *mut u16) -> String {
 }
 
 #[cfg(windows)]
-unsafe fn sockaddr_ipv4(sa: *mut windows_sys::Win32::Networking::WinSock::SOCKADDR) -> Option<Ipv4Addr> {
+unsafe fn sockaddr_ipv4(
+    sa: *mut windows_sys::Win32::Networking::WinSock::SOCKADDR,
+) -> Option<Ipv4Addr> {
     use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
     if sa.is_null() {
         return None;
@@ -430,7 +435,10 @@ fn run_tcp_probe(app: &AppHandle, host: &str, port: u16, timeout_ms: u64) -> Pro
     let timeout = Duration::from_millis(timeout_ms.max(100));
     log_info(
         app,
-        format!("开始检测 TCP {host}:{port}（超时 {} ms）", timeout_ms.max(100)),
+        format!(
+            "开始检测 TCP {host}:{port}（超时 {} ms）",
+            timeout_ms.max(100)
+        ),
     );
 
     let ip = match resolve_ipv4(host) {
@@ -482,7 +490,10 @@ fn run_tcp_probe(app: &AppHandle, host: &str, port: u16, timeout_ms: u64) -> Pro
 
     match result {
         Ok(_) => {
-            log_info(app, format!("收到 SYN-ACK，TCP 握手成功，耗时 {elapsed} ms"));
+            log_info(
+                app,
+                format!("收到 SYN-ACK，TCP 握手成功，耗时 {elapsed} ms"),
+            );
             log_info(app, "检测结束：连接成功");
             ProbeResult {
                 success: true,
@@ -740,7 +751,11 @@ fn run_ping(app: &AppHandle, host: &str, count: u32, timeout_ms: u64) -> PingRes
         min_ms: min,
         max_ms: max,
         loss_percent: loss,
-        reason: if success { None } else { Some("所有请求均失败".into()) },
+        reason: if success {
+            None
+        } else {
+            Some("所有请求均失败".into())
+        },
     }
 }
 

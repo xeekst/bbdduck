@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { OccupancyScanResult } from "./file-occupancy-types";
+import type { PortOccupancyScanResult } from "./port-occupancy-types";
+import type { TcpConnectionStatistics } from "./tcp-connection-types";
 import type {
+  CompletedPage,
   JobSnapshot,
   RecentConnection,
   RemoteInfo,
@@ -52,6 +55,8 @@ export const api = {
   syncStop: (jobId: string) => invoke<void>("sync_stop", { jobId }),
   syncActiveJobs: () => invoke<JobSnapshot[]>("sync_active_jobs"),
   syncHistory: (limit: number) => invoke<JobSnapshot[]>("sync_history", { limit }),
+  syncListCompleted: (root: string, relative: string, offset: number, limit: number) =>
+    invoke<CompletedPage>("sync_list_completed", { root, relative, offset, limit }),
 
   saveServerConfig: (name: string, ip: string, port: number, folders: string[], scanWorkers: number) =>
     invoke<number>("save_server_config", { name, ip, port, folders, scanWorkers }),
@@ -66,6 +71,18 @@ export const api = {
     invoke<OccupancyScanResult>("file_occupancy_scan", { query }),
   fileOccupancyTerminate: (pid: number, processToken: string) =>
     invoke<void>("file_occupancy_terminate", { pid, processToken }),
+  portOccupancyScan: (port: number) =>
+    invoke<PortOccupancyScanResult>("port_occupancy_scan", { port }),
+  tcpConnectionStats: (
+    port: number,
+    sourceIp: string | null,
+    localIp: string | null
+  ) =>
+    invoke<TcpConnectionStatistics>("tcp_connection_stats", {
+      port,
+      sourceIp,
+      localIp,
+    }),
   netLocalInfo: () => invoke<LocalNetInfo>("net_local_info"),
   netTcpProbe: (host: string, port: number, timeoutMs: number) =>
     invoke<ProbeResult>("net_tcp_probe", { host, port, timeoutMs }),

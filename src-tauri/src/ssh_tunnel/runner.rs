@@ -96,7 +96,10 @@ pub async fn run_tunnel(mgr: Arc<dyn TunnelEvents>, rt: Arc<TunnelRuntime>) {
         mgr.log(
             &rt,
             "info",
-            format!("第 {attempt} 次尝试连接 SSH {} …", rt.config.ssh_server_display()),
+            format!(
+                "第 {attempt} 次尝试连接 SSH {} …",
+                rt.config.ssh_server_display()
+            ),
         );
         match run_attempt(&mgr, &rt).await {
             Ok(()) => break,
@@ -202,15 +205,25 @@ impl russh::client::Handler for ClientHandler {
                 Ok(mut socket) => {
                     reply.accept().await;
                     rt_task.connections.fetch_add(1, Ordering::Relaxed);
-                    mgr.log(&rt_task, "info", format!("远程转发: {origin} → {target_host}:{target_port}"));
+                    mgr.log(
+                        &rt_task,
+                        "info",
+                        format!("远程转发: {origin} → {target_host}:{target_port}"),
+                    );
                     let mut stream = channel.into_stream();
                     match tokio::io::copy_bidirectional(&mut socket, &mut stream).await {
                         Ok((up, down)) => {
                             rt_task.bytes_up.fetch_add(up, Ordering::Relaxed);
                             rt_task.bytes_down.fetch_add(down, Ordering::Relaxed);
-                            mgr.log(&rt_task, "info", format!("远程转发: {origin} 断开（↑{up} B ↓{down} B）"));
+                            mgr.log(
+                                &rt_task,
+                                "info",
+                                format!("远程转发: {origin} 断开（↑{up} B ↓{down} B）"),
+                            );
                         }
-                        Err(e) => mgr.log(&rt_task, "warn", format!("远程转发: {origin} 中断: {e}")),
+                        Err(e) => {
+                            mgr.log(&rt_task, "warn", format!("远程转发: {origin} 中断: {e}"))
+                        }
                     }
                     rt_task.connections.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -220,9 +233,7 @@ impl russh::client::Handler for ClientHandler {
                         "warn",
                         format!("远程转发: 无法连接本地目标 {target_host}:{target_port}: {e}"),
                     );
-                    reply
-                        .reject(russh::ChannelOpenFailure::ConnectFailed)
-                        .await;
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
                 }
             }
         });
@@ -247,13 +258,10 @@ async fn connect_auth(
         target_host: cfg.target_host.clone(),
         target_port: cfg.target_port,
     };
-    let mut handle = russh::client::connect(
-        client_cfg,
-        (cfg.ssh_host.clone(), cfg.ssh_port),
-        handler,
-    )
-    .await
-    .map_err(|e| RunError::transient(format!("SSH 连接失败: {e}")))?;
+    let mut handle =
+        russh::client::connect(client_cfg, (cfg.ssh_host.clone(), cfg.ssh_port), handler)
+            .await
+            .map_err(|e| RunError::transient(format!("SSH 连接失败: {e}")))?;
 
     let auth_res = match cfg.auth {
         AuthKind::Password => {
@@ -388,7 +396,11 @@ async fn run_remote_tcp(
                 "请求远程端口转发失败（若监听非 127.0.0.1，需服务器允许 GatewayPorts）: {e}"
             ))
         })?;
-    let actual_port: u16 = if chosen != 0 { chosen as u16 } else { cfg.listen_port };
+    let actual_port: u16 = if chosen != 0 {
+        chosen as u16
+    } else {
+        cfg.listen_port
+    };
     rt.set_listen_addr(&format!("{}:{}", cfg.ssh_host, actual_port));
     mgr.emit_state(rt);
     mgr.log(
@@ -560,9 +572,7 @@ const MAX_FRAME: usize = 65536;
 const UDP_FLOW_MAX: usize = 512;
 const UDP_FLOW_IDLE: Duration = Duration::from_secs(120);
 
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> std::io::Result<(u8, u32, Vec<u8>)> {
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<(u8, u32, Vec<u8>)> {
     let mut hdr = [0u8; FRAME_HEADER];
     r.read_exact(&mut hdr).await?;
     let op = hdr[0];
@@ -856,9 +866,13 @@ async fn run_local_udp(
                         if let Some(peer) = peer {
                             match sock.send_to(&data, peer).await {
                                 Ok(_) => {
-                                    rt_task.bytes_down.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    rt_task
+                                        .bytes_down
+                                        .fetch_add(data.len() as u64, Ordering::Relaxed);
                                 }
-                                Err(e) => mgr.log(&rt_task, "warn", format!("UDP 回包发送失败: {e}")),
+                                Err(e) => {
+                                    mgr.log(&rt_task, "warn", format!("UDP 回包发送失败: {e}"))
+                                }
                             }
                         }
                     }
